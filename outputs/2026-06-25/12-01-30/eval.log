@@ -1,0 +1,4 @@
+[2026-06-25 12:02:28,798][datasets][INFO] - JAX version 0.6.2 available.
+[2026-06-25 12:03:39,980][root][INFO] - Cached 'action' from '/home/unnat/.stable-wm/datasets/pusht_expert_train.h5'
+[2026-06-25 12:03:40,628][root][INFO] - Cached 'proprio' from '/home/unnat/.stable-wm/datasets/pusht_expert_train.h5'
+[2026-06-25 12:03:41,468][root][INFO] - Cached 'state' from '/home/unnat/.stable-wm/datasets/pusht_expert_train.h5'
