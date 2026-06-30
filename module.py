@@ -283,3 +283,60 @@ class ARPredictor(nn.Module):
         x = self.dropout(x)
         x = self.transformer(x, c)
         return x
+
+
+class _EncoderOutput:
+    """Stand-in for the HF ViT model output. JEPA.encode() reads
+    `output.last_hidden_state[:, 0]` as the per-frame embedding (the CLS token slot
+    for a real ViT), so a single pooled feature in that slot is enough to be a
+    drop-in replacement."""
+
+    def __init__(self, last_hidden_state):
+        self.last_hidden_state = last_hidden_state
+
+
+class ConvEncoder(nn.Module):
+    """Convolutional encoder — drop-in replacement for stable_pretraining.backbone.utils.vit_hf.
+
+    Matches vit_hf's calling convention (`encoder(pixels, interpolate_pos_encoding=...)`)
+    and output shape contract (`.last_hidden_state[:, 0]` -> (N, output_dim)), so it can be
+    swapped in via the `encoder._target_` in config/train/model/lewm.yaml without touching
+    jepa.py. `output_dim` must equal `embed_dim` so the downstream projector's input_dim
+    still matches.
+
+    hidden_dim must be divisible by 4.
+    """
+
+    def __init__(self, image_size=224, in_channels=3, output_dim=192, hidden_dim=192):
+        super().__init__()
+        assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4"
+        self.image_size = image_size
+        self.output_dim = output_dim
+
+        def conv_block(c_in, c_out):
+            return nn.Sequential(
+                nn.Conv2d(c_in, c_out, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(c_out),
+                nn.GELU(),
+            )
+
+        # 4 stride-2 stages: 224 -> 112 -> 56 -> 28 -> 14 (for the default image_size)
+        self.stem = conv_block(in_channels, hidden_dim // 4)
+        self.stages = nn.Sequential(
+            conv_block(hidden_dim // 4, hidden_dim // 2),
+            conv_block(hidden_dim // 2, hidden_dim),
+            conv_block(hidden_dim, hidden_dim),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.head = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, pixels, interpolate_pos_encoding=True):
+        """
+        pixels: (N, C, H, W)
+        returns: _EncoderOutput with last_hidden_state of shape (N, 1, output_dim)
+        """
+        x = self.stem(pixels)
+        x = self.stages(x)
+        x = self.pool(x).flatten(1)  # (N, hidden_dim)
+        x = self.head(x)  # (N, output_dim)
+        return _EncoderOutput(x.unsqueeze(1))  # (N, 1, output_dim)
