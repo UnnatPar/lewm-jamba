@@ -2,6 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
+from torchvision.models import convnext_tiny
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
@@ -296,7 +297,7 @@ class _EncoderOutput:
 
 
 class ConvEncoder(nn.Module):
-    """Convolutional encoder — drop-in replacement for stable_pretraining.backbone.utils.vit_hf.
+    """ConvNeXt-Tiny encoder — drop-in replacement for stable_pretraining.backbone.utils.vit_hf.
 
     Matches vit_hf's calling convention (`encoder(pixels, interpolate_pos_encoding=...)`)
     and output shape contract (`.last_hidden_state[:, 0]` -> (N, output_dim)), so it can be
@@ -304,39 +305,35 @@ class ConvEncoder(nn.Module):
     jepa.py. `output_dim` must equal `embed_dim` so the downstream projector's input_dim
     still matches.
 
-    hidden_dim must be divisible by 4.
+    Uses torchvision's ConvNeXt-Tiny feature stack (random init, no pretrained weights):
+    a patchify stem (stride 4) followed by 4 stages of real ConvNeXt blocks, fixed channel
+    progression 96 -> 192 -> 384 -> 768. At image_size=224 this yields a 7x7x768 feature map.
     """
 
-    def __init__(self, image_size=224, in_channels=3, output_dim=192, hidden_dim=192):
+    def __init__(self, image_size=224, in_channels=3, output_dim=192):
         super().__init__()
-        assert hidden_dim % 4 == 0, "hidden_dim must be divisible by 4"
         self.image_size = image_size
         self.output_dim = output_dim
 
-        def conv_block(c_in, c_out):
-            return nn.Sequential(
-                nn.Conv2d(c_in, c_out, kernel_size=4, stride=2, padding=1),
-                nn.BatchNorm2d(c_out),
-                nn.GELU(),
+        self.features = convnext_tiny(weights=None).features
+        if in_channels != 3:
+            stem_conv = self.features[0][0]
+            self.features[0][0] = nn.Conv2d(
+                in_channels,
+                stem_conv.out_channels,
+                kernel_size=stem_conv.kernel_size,
+                stride=stem_conv.stride,
             )
 
-        # 4 stride-2 stages: 224 -> 112 -> 56 -> 28 -> 14 (for the default image_size)
-        self.stem = conv_block(in_channels, hidden_dim // 4)
-        self.stages = nn.Sequential(
-            conv_block(hidden_dim // 4, hidden_dim // 2),
-            conv_block(hidden_dim // 2, hidden_dim),
-            conv_block(hidden_dim, hidden_dim),
-        )
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.head = nn.Linear(hidden_dim, output_dim)
+        self.head = nn.Linear(768, output_dim)
 
     def forward(self, pixels, interpolate_pos_encoding=True):
         """
         pixels: (N, C, H, W)
         returns: _EncoderOutput with last_hidden_state of shape (N, 1, output_dim)
         """
-        x = self.stem(pixels)
-        x = self.stages(x)
-        x = self.pool(x).flatten(1)  # (N, hidden_dim)
+        x = self.features(pixels)
+        x = self.pool(x).flatten(1)  # (N, 768)
         x = self.head(x)  # (N, output_dim)
         return _EncoderOutput(x.unsqueeze(1))  # (N, 1, output_dim)
