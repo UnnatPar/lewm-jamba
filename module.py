@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 from torchvision.models import convnext_tiny
+from transformers import JambaConfig, JambaModel
 
 def modulate(x, shift, scale):
     """AdaLN-zero modulation"""
@@ -337,3 +338,114 @@ class ConvEncoder(nn.Module):
         x = self.pool(x).flatten(1)  # (N, 768)
         x = self.head(x)  # (N, output_dim)
         return _EncoderOutput(x.unsqueeze(1))  # (N, 1, output_dim)
+
+
+class JambaEncoder(nn.Module):
+    """Bidirectional Jamba (hybrid Mamba+Attention) encoder — drop-in replacement for
+    ConvEncoder. Matches the same calling convention (`encoder(pixels, interpolate_pos_encoding=...)`)
+    and output shape contract (`.last_hidden_state[:, 0]` -> (N, output_dim)).
+
+    Patchifies the image ViT-style into a 1D sequence of tokens, then runs the same
+    weight-shared `transformers.JambaModel` stack twice over that sequence — once
+    forward, once over the reversed sequence — and sums the two (re-aligned) output
+    sequences before mean-pooling. Since Jamba's Mamba and Attention layers are both
+    causal, the forward pass gives every token left-context and the reversed pass
+    gives every token right-context; summing recovers full bidirectional context
+    without adding parameters (the same recipe used by Vision Mamba / VideoMamba to
+    make a causal SSM stack read images non-causally).
+
+    Uses `use_mamba_kernels=False` (pure PyTorch fallback for the Mamba scan) so no
+    mamba-ssm/causal-conv1d native build is required. `num_experts=1` makes every
+    Jamba layer's FFN a dense JambaMLP (no MoE router). Default config sizing is
+    tuned to land at ~15M total parameters — a fair, non-parameter-scaled-biased
+    comparison against the ViT-tiny / ConvNeXt-tiny encoders this replaces.
+    """
+
+    def __init__(
+        self,
+        image_size=224,
+        in_channels=3,
+        patch_size=16,
+        output_dim=192,
+        hidden_size=288,
+        intermediate_size=1152,
+        num_hidden_layers=10,
+        num_attention_heads=8,
+        num_key_value_heads=4,
+        attn_layer_period=10,
+        attn_layer_offset=9,
+        mamba_d_state=16,
+        mamba_d_conv=4,
+        mamba_expand=2,
+    ):
+        super().__init__()
+        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.patch_size = patch_size
+        grid_size = image_size // patch_size
+        num_patches = grid_size * grid_size
+
+        self.patch_embed = nn.Conv2d(
+            in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
+        )
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, hidden_size) * 0.02)
+
+        config = JambaConfig(
+            vocab_size=8,  # unused: we bypass embed_tokens via inputs_embeds
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_hidden_layers=num_hidden_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            attn_layer_period=attn_layer_period,
+            attn_layer_offset=attn_layer_offset,
+            num_experts=1,
+            num_experts_per_tok=1,
+            mamba_d_state=mamba_d_state,
+            mamba_d_conv=mamba_d_conv,
+            mamba_expand=mamba_expand,
+            use_mamba_kernels=False,
+            max_position_embeddings=num_patches,
+        )
+        self.jamba = JambaModel(config)
+        self.jamba.embed_tokens.requires_grad_(False)  # unused: bypassed via inputs_embeds
+        self.head = nn.Linear(hidden_size, output_dim)
+
+    def _interpolate_pos_encoding(self, x, height, width):
+        """Bicubic-interpolate the learned patch position embedding to a new grid size,
+        mirroring ViT's `interpolate_pos_encoding` so images that aren't `image_size`
+        (e.g. during eval at a different resolution) still get a matching pos embedding."""
+        num_patches = x.size(1)
+        num_positions = self.pos_embedding.size(1)
+        if num_patches == num_positions:
+            return self.pos_embedding
+
+        dim = x.size(-1)
+        old_grid_size = int(num_positions**0.5)
+        new_h, new_w = height // self.patch_size, width // self.patch_size
+        pos = self.pos_embedding.reshape(1, old_grid_size, old_grid_size, dim)
+        pos = pos.permute(0, 3, 1, 2)
+        pos = F.interpolate(pos, size=(new_h, new_w), mode="bicubic", align_corners=False)
+        return pos.permute(0, 2, 3, 1).reshape(1, new_h * new_w, dim)
+
+    def forward(self, pixels, interpolate_pos_encoding=True):
+        """
+        pixels: (N, C, H, W)
+        returns: _EncoderOutput with last_hidden_state of shape (N, 1, output_dim)
+        """
+        _, _, height, width = pixels.shape
+        x = self.patch_embed(pixels).flatten(2).transpose(1, 2)  # (N, L, hidden_size)
+
+        pos = (
+            self._interpolate_pos_encoding(x, height, width)
+            if interpolate_pos_encoding
+            else self.pos_embedding
+        )
+        x = x + pos
+
+        out_fwd = self.jamba(inputs_embeds=x).last_hidden_state
+        out_bwd = self.jamba(inputs_embeds=x.flip(dims=[1])).last_hidden_state
+        out = out_fwd + out_bwd.flip(dims=[1])  # re-align backward pass to forward token order
+
+        pooled = out.mean(dim=1)  # (N, hidden_size)
+        pooled = self.head(pooled)  # (N, output_dim)
+        return _EncoderOutput(pooled.unsqueeze(1))  # (N, 1, output_dim)
