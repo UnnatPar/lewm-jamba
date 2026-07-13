@@ -7,7 +7,7 @@ defaults:
 wandb:
   enabled: True
   config:
-    entity: unnat-par-new-york-university-org
+    entity: unnat-par-new-york-university
     project: lewm-jamba
     name: ${output_model_name}
     id: ${subdir}
