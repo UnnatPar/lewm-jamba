@@ -403,10 +403,10 @@ class JambaEncoder(nn.Module):
             mamba_d_state=mamba_d_state,
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
-            use_mamba_kernels=False,
+            use_mamba_kernels=True,
             max_position_embeddings=num_patches,
         )
-        self.jamba = JambaModel(config)
+        self.jamba = JambaModel(config).to(torch.bfloat16)
         self.jamba.embed_tokens.requires_grad_(False)  # unused: bypassed via inputs_embeds
         self.head = nn.Linear(hidden_size, output_dim)
 
@@ -442,10 +442,11 @@ class JambaEncoder(nn.Module):
         )
         x = x + pos
 
+        x = x.to(torch.bfloat16)
         out_fwd = self.jamba(inputs_embeds=x).last_hidden_state
         out_bwd = self.jamba(inputs_embeds=x.flip(dims=[1])).last_hidden_state
         out = out_fwd + out_bwd.flip(dims=[1])  # re-align backward pass to forward token order
 
-        pooled = out.mean(dim=1)  # (N, hidden_size)
+        pooled = out.mean(dim=1).to(self.head.weight.dtype)  # (N, hidden_size)
         pooled = self.head(pooled)  # (N, output_dim)
         return _EncoderOutput(pooled.unsqueeze(1))  # (N, 1, output_dim)
