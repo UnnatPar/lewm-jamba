@@ -397,16 +397,131 @@ at `scratchpad/validate_ssd.py` / `scratchpad/validate_ssd_full.py` if this
 direction is revisited, but as of this result it's a dead end relative to
 CUDA-kernel-based approaches, not a promising unfinished lever.
 
-`benchmark_seq_scaling.py`'s `__main__` sweep now runs three models:
-`BidirectionalJambaBatched` (previous best, eager, full Mamba-1 fidelity),
-`BidirectionalJambaBatchedFullCompiledGlue` (restored surgical-compile
-variant, full fidelity, the still-unverified ~27 it/s claim — this is the
-one worth re-measuring next), `BidirectionalViTCompiled` (fair baseline).
-Still removed (not restored, not needed for any current question):
-`BidirectionalJamba`, `JambaBiMambaMixer`/`JambaBiMambaDecoderLayer`,
-`BidirectionalJambaFused`, uncompiled `BidirectionalViT`,
-`check_mamba_kernel_generation`, `benchmark_cuda_graph`/`run_sweep_graphed`,
-`profile_model`. Since these files are untracked in git, "recover from git
-history" is not an option for anything cut from here — recovery has to come
-from conversation context while it's still available, same as the surgical-
-compile restoration above.
+`benchmark_seq_scaling.py` is now **tracked in git**. Everything cut from it from this point on
+is recoverable from history, which was not true for any earlier trim — the surgical-compile
+classes had to be reconstructed from conversation context precisely because the file was
+untracked. That failure mode is closed.
+
+---
+
+## Step 9: the measurement standard was wrong, and it had inverted a conclusion
+
+Everything above was measured as forward+backward on a synthetic tensor at batch 1, feeding
+`inputs_embeds` straight into the encoder stack. That is not a training step, and the difference
+is not cosmetic:
+
+- **Batch 1 ranks variants by launch overhead, not compute.** Jamba's it/s being flat across a
+  64x range of L is the signature of overhead dominating. Real training saturates the GPU, where
+  the ranking can and does change.
+- **Static input addresses flatter anything CUDA-graph-dependent.** A dataloader hands the model
+  tensors at fresh addresses each step; a benchmark reusing one tensor does not.
+- **No optimizer step, no loss, no head.** Parameter mutation between iterations is part of what
+  breaks cudagraph reuse.
+
+The standard is now: **every performance claim comes from a full training step** — dataloader,
+head, real loss, backward, `optimizer.step()` — with the cudagraph-fallback count reported.
+`realcross.py` is that harness. The synthetic sweep in `benchmark_seq_scaling.py` is retained
+only for quick shape-scaling checks and is explicitly not evidence.
+
+**Rejected on this basis: explicit CUDA graph capture** (`torch.cuda.make_graphed_callables`).
+It measured extremely well — crossover 8968 → 4651 — and was discarded anyway, because it needs
+static shapes and buffers that a real training loop does not provide. `torch.compile(mode=
+"reduce-overhead")` stays: it is ordinary `torch.compile`, recompiles on shape change, and runs
+under a normal loop.
+
+## Step 10: the ViT baseline was never parameter-matched
+
+`BidirectionalViTCompiled` had **9,990,720** parameters against the Jamba stack's **12,683,520**
+— 21% smaller — while its docstring claimed matched size. Nothing in the code asserted it.
+
+A smaller baseline is a faster baseline, so **every crossover number this project produced before
+2026-07-28 was biased in Jamba's favour.** Fixed by widening to `hidden=328` (12,952,720, +2.1%),
+the closest head-divisible width. Width and not depth, because depth changes the sequential
+kernel-launch count, which is the quantity the Jamba side is being measured on.
+
+Effect: crossover moved the *wrong* way, 8049 → 8968, before any optimization moved it back.
+That is what fixing a favourable bug looks like.
+
+## Step 11: custom-op registration — the graph breaks are the cost
+
+`torch._dynamo.explain` on the 10-layer stack: **9 breaks, 10 graphs.** One break per Mamba
+layer, at `selective_scan_fn`. Dynamo cannot trace a pybind11 extension, so `torch.compile` only
+ever optimized fragments and inductor's cudagraph trees could never span the model. This is what
+capped everything at "surgical compile".
+
+Step 8 recorded custom-op/meta-kernel registration as attempted and abandoned. It is tractable
+with `torch.library.custom_op`: register `selective_scan` as a real op with a **fake (meta)
+implementation** for forward and backward, and every break disappears — **9 → 0, 10 graphs → 1.**
+
+`torch._dynamo.allow_in_graph` alone is *not* sufficient: it keeps the call in the graph but
+fake-tensor propagation then fails, because there is no metadata describing the output. The fake
+impl is the load-bearing part.
+
+Three bugs found here, each of which had been reporting success:
+
+- The equivalence check only exercised the `z`-provided path. `bench` calls with `z=None`, so the
+  shim fell back to the unregistered kernel on every real call while the check said PASS. A check
+  that does not cover the path production uses is not a check.
+- `register_fake` returned `torch.empty_like(u)`, inheriting strides the real (post-`.clone()`)
+  output does not have → inductor stride assertion at runtime.
+- `B`/`C` arrive 3-D; the Python wrapper reshapes to 4-D before the CUDA entry point, and calling
+  the kernel directly skipped that.
+
+## Step 12: fused backward instead of recompute
+
+The first working custom op computed gradients by re-running the scan forward under `enable_grad`
+and taking `autograd.grad` — correct, and cheap to get right, but **2 forwards + 1 backward per
+step instead of 1 + 1**. At batch 1 that hid inside launch overhead; at batch 16 it is pure loss.
+
+Saving the scan state `x` from `selective_scan_cuda.fwd` and calling `selective_scan_cuda.bwd`
+directly is worth **8–13% across the range** — and it is the change that put the crossover under
+2000.
+
+The equivalence check earned its keep again here: with `z` provided, `selective_scan_cuda.fwd`
+returns the **pre-gating** output, which showed up as a `9.0e+01` forward error. That path now
+routes to the unmodified kernel; `bench` never uses it.
+
+---
+
+## Net result (real training step, batch 16, parameter-matched baseline)
+
+| Stage | Crossover vs ViT |
+|---|---|
+| Naive double-pass (historical, synthetic) | ~15,000–20,000 |
+| Batched scan + surgical compile, unfair baseline (synthetic) | 8,049 |
+| …with the baseline actually parameter-matched | 8,968 |
+| Surgical compile, real training step | 4,197 |
+| + custom-op registration, recompute backward | 3,718 |
+| **+ fused backward (`sscanop2.py`) — current** | **1,868** |
+
+| L | ViT matched | Jamba SOTA |
+|---|---|---|
+| 196 | 126.04 | 86.94 |
+| 1568 | 19.49 | 16.21 |
+| **2048** | **14.27** | **15.99** ← crosses |
+| 6272 | 2.51 | 3.84 |
+
+Peak memory at L=6272: **0.27 GB vs 5.05 GB** for surgical compile.
+
+**No capacity cost.** Same kernel, same values: forward bitwise identical (`0.000e+00`), gradients
+at `7.6e-6` fp32 roundoff. `A` remains `(d_inner, d_state)` — 4608 independent decay rates, full
+Mamba-1 fidelity. No hyperparameter, layer count, or weight-sharing change.
+
+## Where the SOTA configuration lives
+
+`BidirectionalJambaBatched` under `torch.compile(mode="reduce-overhead")`, with
+`sscanop2.register()` called first. `sscanop2.py` is the registration; `realcross.py` is the
+training-step harness; `crossover.py` computes the number and the chart.
+
+## Open
+
+**None of this is in the trained model.** `config/train/model/lewm.yaml` points at
+`module.py:JambaEncoder`, which still runs the naive double-pass (`self.jamba(...)` twice, lines
+446–447) with `mamba_expand=2` via HuggingFace `JambaModel`. Every optimization in this document
+lives only in `benchmark_seq_scaling.py`. Porting is required before any of it affects PushT
+training.
+
+Also: `module.py:357` claims `use_mamba_kernels=False`; line 406 sets it `True`. Stale comment.
+
+The 1,868 figure is measured at batch 16. At batch 64 the advantage narrows, and real training
+runs 64–128 — expect the real-training crossover to be higher than 1,868 until measured there.

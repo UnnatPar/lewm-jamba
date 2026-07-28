@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 sys.path.insert(0, "/content")
 import bench
-import sscanop as co
+import sscanop2 as co  # fused backward; sscanop.py (recompute backward) was superseded
 
 DEVICE, DTYPE = "cuda", torch.bfloat16
 GRID = [196, 256, 320, 392, 512, 640, 784, 1024, 1568, 3136, 6272]
