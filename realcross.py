@@ -149,4 +149,8 @@ def main():
         {k: {str(L): v for L, v in c.items()} for k, c in out.items()}), flush=True)
 
 
-main()
+# Guarded so other harnesses can import ViTEnc/Wrapped/Head instead of re-declaring the
+# baseline -- that kind of duplication is what produced a 21%-undersized ViT once already.
+# Run it as a sweep with runpy.run_path(path, run_name="__main__"), not `colab exec -f`.
+if __name__ == "__main__":
+    main()
