@@ -1,0 +1,24 @@
+=== ViT-style Transformer, param-matched (compiled) ===
+L=   196  it/s= 126.04  peak_mem=  0.13 GB
+L=   392  it/s=  81.08  peak_mem=  0.13 GB
+L=   784  it/s=  43.29  peak_mem=  0.14 GB
+L=  1568  it/s=  19.49  peak_mem=  0.18 GB
+L=  2048  it/s=  14.27  peak_mem=  0.20 GB
+L=  3136  it/s=   7.51  peak_mem=  0.24 GB
+L=  6272  it/s=   2.51  peak_mem=  0.27 GB
+=== Jamba single-graph compile (custom-op registered) ===
+L=   196  it/s=  86.94  peak_mem=  0.12 GB
+L=   392  it/s=  57.62  peak_mem=  0.12 GB
+L=   784  it/s=  31.13  peak_mem=  0.13 GB
+L=  1568  it/s=  16.21  peak_mem=  0.14 GB
+L=  2048  it/s=  15.99  peak_mem=  0.15 GB
+L=  3136  it/s=   8.17  peak_mem=  0.18 GB
+L=  6272  it/s=   3.84  peak_mem=  0.27 GB
+=== Jamba surgical compile (previous best) ===
+L=   196  it/s=  20.94  peak_mem=  0.26 GB
+L=   392  it/s=  21.30  peak_mem=  0.42 GB
+L=   784  it/s=  21.19  peak_mem=  0.73 GB
+L=  1568  it/s=  13.88  peak_mem=  1.35 GB
+L=  2048  it/s=  12.90  peak_mem=  1.71 GB
+L=  3136  it/s=   6.93  peak_mem=  2.61 GB
+L=  6272  it/s=   3.31  peak_mem=  5.05 GB

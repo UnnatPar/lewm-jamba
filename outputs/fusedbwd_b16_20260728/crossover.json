@@ -1,0 +1,115 @@
+{
+  "crossovers": {
+    "Jamba single-graph compile (custom-op registered)  vs  ViT-style Transformer, param-matched (compiled)": {
+      "crossover": 1868,
+      "bracket": [
+        1568,
+        2048
+      ],
+      "reason": "interpolated in log-L between the bracketing measurements"
+    },
+    "Jamba surgical compile (previous best)  vs  ViT-style Transformer, param-matched (compiled)": {
+      "crossover": 4197,
+      "bracket": [
+        3136,
+        6272
+      ],
+      "reason": "interpolated in log-L between the bracketing measurements"
+    }
+  },
+  "best_crossover": 1868,
+  "target": 2000,
+  "target_met": true,
+  "models": {
+    "ViT-style Transformer, param-matched (compiled)": {
+      "196": {
+        "it_per_s": 126.04,
+        "peak_mem_gb": 0.13
+      },
+      "392": {
+        "it_per_s": 81.08,
+        "peak_mem_gb": 0.13
+      },
+      "784": {
+        "it_per_s": 43.29,
+        "peak_mem_gb": 0.14
+      },
+      "1568": {
+        "it_per_s": 19.49,
+        "peak_mem_gb": 0.18
+      },
+      "2048": {
+        "it_per_s": 14.27,
+        "peak_mem_gb": 0.2
+      },
+      "3136": {
+        "it_per_s": 7.51,
+        "peak_mem_gb": 0.24
+      },
+      "6272": {
+        "it_per_s": 2.51,
+        "peak_mem_gb": 0.27
+      }
+    },
+    "Jamba single-graph compile (custom-op registered)": {
+      "196": {
+        "it_per_s": 86.94,
+        "peak_mem_gb": 0.12
+      },
+      "392": {
+        "it_per_s": 57.62,
+        "peak_mem_gb": 0.12
+      },
+      "784": {
+        "it_per_s": 31.13,
+        "peak_mem_gb": 0.13
+      },
+      "1568": {
+        "it_per_s": 16.21,
+        "peak_mem_gb": 0.14
+      },
+      "2048": {
+        "it_per_s": 15.99,
+        "peak_mem_gb": 0.15
+      },
+      "3136": {
+        "it_per_s": 8.17,
+        "peak_mem_gb": 0.18
+      },
+      "6272": {
+        "it_per_s": 3.84,
+        "peak_mem_gb": 0.27
+      }
+    },
+    "Jamba surgical compile (previous best)": {
+      "196": {
+        "it_per_s": 20.94,
+        "peak_mem_gb": 0.26
+      },
+      "392": {
+        "it_per_s": 21.3,
+        "peak_mem_gb": 0.42
+      },
+      "784": {
+        "it_per_s": 21.19,
+        "peak_mem_gb": 0.73
+      },
+      "1568": {
+        "it_per_s": 13.88,
+        "peak_mem_gb": 1.35
+      },
+      "2048": {
+        "it_per_s": 12.9,
+        "peak_mem_gb": 1.71
+      },
+      "3136": {
+        "it_per_s": 6.93,
+        "peak_mem_gb": 2.61
+      },
+      "6272": {
+        "it_per_s": 3.31,
+        "peak_mem_gb": 5.05
+      }
+    }
+  }
+}
