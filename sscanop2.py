@@ -19,12 +19,42 @@ reference, this falls back to the recompute path rather than reporting a fast wr
 """
 
 import torch
+import torch.nn.functional as F
 from typing import List
 
 _ORIG = None
 _SHIM = None
 _BWD_SIG = None
 _CHUNK = 2048          # selective_scan_fwd allocates x with n_chunks = ceil(L / 2048)
+PAD_SCAN = True        # see _pad_len
+
+
+def _pad_len(L):
+    """Round L up to the sequence length the kernel is going to charge for anyway.
+
+    selective_scan dispatches (kNThreads, kNItems) by seqlen, and a block covers
+    kNThreads*kNItems timesteps: 128 up to L=128, then 256, 512, 1024, and 2048 beyond.
+    Whatever is left over in the last block is paid for and thrown away, and measurement says
+    that waste is worth far more than its share -- at batch 16 x 2 directions, d=288:
+
+        L=196  158.3 us      L=256   91.4 us   <- 60 MORE timesteps, 42% LESS time
+        L=320  277.0 us      L=512  140.3 us   <- 192 more timesteps, half the time
+        L=392  219.6 us      L=512  140.3 us
+
+    196 and 392 are exactly the per-frame token counts this project cares about, and both sit
+    on the bad side of a boundary. So pad up to it.
+
+    Exact, not approximate: the padded steps come after every real one, so no real output
+    changes. Slicing the output back to L makes the padded positions' grad_out zero, so the
+    reduced gradients (dA, dD, ddelta_bias) get no contribution from them either -- the
+    backward recursion carries dh = 0 through the whole padded tail.
+    """
+    if not PAD_SCAN:
+        return L
+    for c in (128, 256, 512, 1024):
+        if L <= c:
+            return c
+    return ((L + _CHUNK - 1) // _CHUNK) * _CHUNK
 
 
 def _probe_bwd_signature(u, delta, A, B, C, D, z, delta_bias, dout, x, out, delta_softplus):
@@ -170,10 +200,17 @@ def register(fused_backward=True):
         if return_last_state or D is None or delta_bias is None or z is not None:
             return orig(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
         zz = _NONE.to(u.device, u.dtype) if z is None else z
-        return torch.ops.lewm3.sscan(
+        L = u.shape[-1]
+        Lp = _pad_len(L)
+        if Lp != L:
+            p = (0, Lp - L)
+            u, delta = F.pad(u, p), F.pad(delta, p)
+            B, C = F.pad(B, p), F.pad(C, p)
+        out = torch.ops.lewm3.sscan(
             u.contiguous(), delta.contiguous(), A.contiguous(), B.contiguous(),
             C.contiguous(), D.contiguous(), zz.contiguous(), delta_bias.contiguous(),
             delta_softplus)[0]
+        return out[..., :L] if Lp != L else out
 
     _SHIM = shim
     ssi.selective_scan_fn = shim
@@ -184,11 +221,17 @@ def register(fused_backward=True):
     return orig, shim
 
 
-def verify(orig, shim, device="cuda", batch=2):
+def verify(orig, shim, device="cuda", batch=2, lengths=(64, 196, 392)):
     ok_all = True
-    for label, use_z in (('z provided (falls back, unoptimized)', True), ('z=None (bench''s path, fused)', False)):
+    # Several lengths, because the shim pads L up to the kernel's chunk boundary and a
+    # single length would leave that path untested at the shapes that matter. 196 and 392
+    # both pad; a length that happens to land on a boundary would hide a padding bug.
+    cases = [(f"{lbl}, L={l}", use_z, l)
+             for l in lengths
+             for lbl, use_z in (("z provided (falls back)", True), ("z=None (fused)", False))]
+    for label, use_z, l in cases:
         torch.manual_seed(0)
-        b, d, l, n = batch, 32, 64, 16
+        b, d, n = batch, 32, 16
         mk = lambda *s: torch.randn(*s, device=device, dtype=torch.float32, requires_grad=True)
         u, delta = mk(b, d, l), mk(b, d, l)
         A = (-torch.rand(d, n, device=device).float() - 0.1).requires_grad_(True)
@@ -208,7 +251,7 @@ def verify(orig, shim, device="cuda", batch=2):
         g = max((a - b_).abs().max().item() for a, b_ in zip(*grads))
         good = f < 1e-4 and g < 1e-3
         ok_all &= good
-        print(f"  [{label:<22}] fwd={f:.3e} grad={g:.3e}  "
+        print(f"  [{label:<32}] fwd={f:.3e} grad={g:.3e}  "
               f"{'PASS' if good else '*** FAIL ***'}", flush=True)
     print("  EQUIVALENCE:", "PASS" if ok_all else "*** FAIL ***", flush=True)
     return ok_all

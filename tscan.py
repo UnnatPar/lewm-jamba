@@ -293,6 +293,40 @@ def bench():
     print("TSCAN_JSON " + json.dumps(out), flush=True)
 
 
+def short_sequence_sweep():
+    """The one place left where the CUDA kernel should be beatable: short sequences.
+
+    Fitting the measured scan times (899 us at L=392, 3487 us at L=1868) to s0 + s*L gives
+    s0 = 212 us per layer-call -- an L-independent cost that is 24% of the whole scan at
+    L=392. It is quantisation: mamba dispatches kNThreads=32, kNItems=16 below L=512, so a
+    block covers 512 timesteps and L=392 pays for 512. At L=196 -- the real per-frame token
+    count for this project -- it pays for 512 to use 196, wasting 62%.
+
+    The Triton kernel loops exactly seqlen times and has no such quantisation. Nothing has
+    ever measured either kernel below 392, and 196-392 is precisely the target regime.
+    """
+    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
+    print("\n  short sequences (the target regime; nothing has measured here before):",
+          flush=True)
+    for L in (128, 196, 256, 320, 392, 512, 640, 784):
+        a = make(32, 288, L, 16, torch.bfloat16)
+        t_cuda = timed(lambda: selective_scan_fn(a[0], a[1], a[2], a[3], a[4], a[5], z=None,
+                                                 delta_bias=a[6], delta_softplus=True))
+        best = None
+        for bd in (4, 8, 16):
+            for un in (1, 4, 8):
+                try:
+                    t = timed(lambda: triton_scan(*a, block_d=bd, unroll=un, num_warps=1))
+                except Exception:  # noqa: BLE001
+                    continue
+                if best is None or t < best[0]:
+                    best = (t, bd, un)
+        ns_cuda = t_cuda * 1e9 / (32 * 288 * L)
+        print(f"    L={L:<5} cuda {t_cuda*1e6:8.1f} us ({ns_cuda:5.3f} ns/elem)   "
+              f"triton {best[0]*1e6:8.1f} us (d={best[1]} u={best[2]})   "
+              f"{t_cuda/best[0]:5.2f}x", flush=True)
+
+
 def occupancy_probe():
     """Is this kernel starved of parallel work, or already saturating the GPU?
 
@@ -355,9 +389,7 @@ def main():
     if not validate():
         print("STOPPING: triton scan does not match the reference", flush=True)
         return
-    bidir()
-    occupancy_probe()
-    bench()
+    short_sequence_sweep()
 
 
 main()
