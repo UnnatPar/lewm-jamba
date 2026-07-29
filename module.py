@@ -434,7 +434,13 @@ class JambaEncoder(nn.Module):
             n = bidir.apply_to(self.jamba, impl=mixer_impl)
             # A silent zero here would leave a unidirectional encoder that trains fine and
             # looks fine, so it is worth an assert rather than a log line.
-            assert n == num_hidden_layers - 1, f"patched {n} mixers, expected mamba layers"
+            # Count from the config rather than assuming exactly one attention layer -- with
+            # attn_layer_period > num_hidden_layers there are none, and hardcoding
+            # `num_hidden_layers - 1` turned that into a spurious failure.
+            expected = sum(
+                1 for i in range(num_hidden_layers)
+                if (i % attn_layer_period) != (attn_layer_offset % attn_layer_period))
+            assert n == expected, f"patched {n} mixers, expected {expected}"
         self.head = nn.Linear(hidden_size, output_dim)
 
     def _interpolate_pos_encoding(self, x, height, width):
