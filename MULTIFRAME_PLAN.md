@@ -6,6 +6,12 @@ there; at 11 frames it spills to a 4,096 chunk and loses (0.854x). See the ledge
 
 ---
 
+**Status 2026-07-29: §0, §1, §2 are built and committed (`0a30abf`). §3 partly. §4, §5 open.**
+The leakage fix in §0 is *not* the block-causal design originally written here — see the
+revision note below.
+
+---
+
 ## 0. The flaw to decide first: temporal leakage
 
 The encoder today is **per-frame**. `jepa.py:encode()` does
@@ -31,6 +37,36 @@ one that has not. And there is no EMA target or stop-gradient here to break the 
 This is the "runs fine, result is meaningless" failure class, and it is the single highest risk
 in this change.
 
+### REVISED — the adopted fix is sliding windows, not block-causal
+
+The block-causal design below was **not built**. It buys leak-freedom by forbidding any frame
+from seeing a later one, which throws away exactly the cross-frame bidirectionality that
+motivates a window encoder at all. The adopted design keeps full bidirectionality inside each
+window and gets leak-freedom from the *window layout* instead:
+
+- `T = 14` frames per sample; windows of `W = 10` sliding by `stride = 1` → **5 windows**.
+- Window `k` covers frames `k … k+9`. It contributes **one** timestep: its **last slot**, i.e.
+  frame `k+9` seen through frames `k … k+9`.
+- `ctx = emb[:, :4]` (newest frames 9, 10, 11, 12), `tgt = emb[:, 1:]` (newest frames 10, 11,
+  12, 13). The existing slicing in `train.py` is unchanged.
+- No context window contains the frame its target predicts: window `k` ends at frame `k+9`, its
+  target is frame `k+10`. Verified exhaustively, not argued — `test_multiframe.py` perturbs each
+  of the 14 frames and checks all 70 (frame, timestep) dependency pairs.
+
+There is no context-free "frame `t` embedding" anywhere in this design. Frame 10 as seen through
+`[1:11]` is a different tensor from frame 10 as seen through `[2:12]`. That is intended: the
+axiom being tested is that joint encoding yields a richer representation than encoding ten
+frames separately and concatenating.
+
+**Why the last slot and not a mean-pool over the window.** A window mean-pool would make the
+target 1/10th about the frame being predicted and 9/10ths about frames the context already
+holds. The last slot keeps the target centred on the novel frame while staying in the same
+space as the context, which is what makes rollout type-correct: the predictor is supervised
+against contextualised window vectors, so it learns to emit them.
+
+<details>
+<summary>Original block-causal proposal, kept for the record — not implemented</summary>
+
 ### The fix: block-causal, not bidirectional
 
 Bidirectional **within** a frame, causal **across** frames. `emb[t]` may see all 196 tokens of
@@ -53,18 +89,40 @@ The reverse scan restriction is a `reshape`, not a kernel change. (It is the sam
 as LBMamba, arXiv 2506.15976 — rejected earlier on speed as a kernel optimisation, required here
 for correctness.)
 
-### The residual risk this does not remove
+</details>
 
-With block-causal encoding, `emb[t+1]` shares most of its input with `emb[t]` (frames `0…t`
-overlap). A predictor can score well by **copying `emb[t]`** without modelling dynamics. The loss
-falls, the model is useless. This is why the cost function has to get more stringent — see §4.
-It must be reported against the copy baseline, or it cannot be interpreted.
+### The residual risk neither design removes
+
+At stride 1, `ctx[k]` and `tgt[k]` share **9 of their 10 frames**. Most of the target is already
+inside the context, so a predictor can score well by carrying the shared mass forward and
+ignoring the one novel frame. The loss falls, the model is useless, nothing raises.
+
+`train.py` therefore logs `copy_loss` (what "predict no change" scores) and `copy_ratio =
+copy_loss / pred_loss` on every step. **`copy_ratio > 1` is the only evidence that any dynamics
+were learned.** A falling `pred_loss` on its own is equally consistent with a well-regularised
+identity function, and must not be reported without the ratio beside it.
+
+### Deferred experiment: disjoint windows (stride = W)
+
+Stride 1 makes the prediction *easier* than the current per-frame task, since context and target
+overlap 90%. Striding by `W` — windows `[0:10], [10:20], [20:30], [30:40]` — makes every
+target's input fully disjoint from its context's, turning the task into "given this clip and
+these actions, what does the next clip look like." Genuinely harder, no copy path, and it makes
+the goal-as-a-clip cost in §4.1 fall out naturally.
+
+Cost: 5 windows either way, but `num_steps` goes 14 → 50, which at `frameskip: 5` is 250 raw
+environment steps — longer than a PushT episode (~120 frames). Would need `frameskip` reduced
+for the within-window spacing. **Held as the next experiment, not folded into this one**;
+`window_stride` is already a config knob, so it costs one line to try.
 
 ---
 
-## 1. `module.py:JambaEncoder`
+## 1. `module.py:JambaEncoder` — BUILT (`0a30abf`)
 
-The real work. Current signature takes `(N, C, H, W)` and returns one pooled vector.
+All of the below is done. Params went 15,495,330 → 15,497,922 (+0.017%, the frame embedding
+alone), so capacity is unchanged. `mamba_expand` was left at the config's **2**, not dropped to
+the measured 1 — reducing it would have cut capacity silently. `mfprobe.py` re-measures the
+window at expand=2 rather than assuming 1,960 still holds.
 
 - accept `(N, F, C, H, W)`; patch-embed per frame; concatenate to `(N, F*196, D)`
 - **two position embeddings**: the existing patch embedding (196) plus a new **frame** embedding
@@ -84,7 +142,11 @@ The real work. Current signature takes `(N, C, H, W)` and returns one pooled vec
 was taken at `mamba_expand=1` with `hidden_size=288`. At expand=2 the scan cost doubles and 1,960
 is no longer the right window. Port at expand=1, or re-measure. Do not assume.
 
-## 2. `jepa.py:encode()`
+## 2. `jepa.py:encode()` — BUILT (`0a30abf`)
+
+Resolved by keeping the `_EncoderOutput` contract and reading `last_hidden_state[:, -1]` instead
+of `[:, 0]`. With `window_size=1` those are the same slot, so `ConvEncoder` and the ViT stay
+drop-in and the old path is reproduced byte-identically (test 5).
 
 Cannot flatten `(b t) -> ...` any more — that is exactly what makes the encoder per-frame. It
 must hand the encoder a window and receive `(B, F, D)`. `last_hidden_state[:, 0]` as the
