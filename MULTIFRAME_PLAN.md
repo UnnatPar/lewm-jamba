@@ -1,0 +1,149 @@
+# Multi-frame Jamba encoder — what changes, and the one thing that would break silently
+
+Measured 2026-07-29. Window size is settled: **10 frames = 1,960 tokens**, the largest multiple
+of 196 that fits under the scan's 2,048 chunk boundary. Jamba beats the matched ViT by 11%
+there; at 11 frames it spills to a 4,096 chunk and loses (0.854x). See the ledger.
+
+---
+
+## 0. The flaw to decide first: temporal leakage
+
+The encoder today is **per-frame**. `jepa.py:encode()` does
+`rearrange(pixels, "b t ... -> (b t) ...")`, so `emb[t]` is a function of frame `t` alone.
+`train.py:lejepa_forward` then does:
+
+```python
+ctx_emb = emb[:, :ctx_len]      # what the predictor sees
+tgt_emb = emb[:, n_preds:]      # what it must predict
+pred_emb = self.model.predict(ctx_emb, ctx_act)
+output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
+```
+
+**If the encoder becomes bidirectional over a 10-frame window, `emb[t]` sees frames `t+1…`, and
+`ctx_emb` therefore already contains the answer.** `pred_loss` collapses toward zero without the
+model learning any dynamics. Nothing raises. The loss curve looks excellent.
+
+SIGReg does not catch this. It constrains the *marginal* distribution of embeddings to be
+isotropic Gaussian; a representation that has leaked the future satisfies that just as well as
+one that has not. And there is no EMA target or stop-gradient here to break the shortcut —
+`tgt_emb` comes from the same tensor as `ctx_emb`, undetached.
+
+This is the "runs fine, result is meaningless" failure class, and it is the single highest risk
+in this change.
+
+### The fix: block-causal, not bidirectional
+
+Bidirectional **within** a frame, causal **across** frames. `emb[t]` may see all 196 tokens of
+frames `≤ t` and nothing of `t+1`. Then:
+
+- every frame keeps full spatial bidirectionality — the property that motivated this encoder;
+- `tgt_emb = emb[t+1…]` depends on frame `t+1`, which `ctx_emb` never saw, so the existing loss
+  in `lejepa_forward` stays correct **unchanged**;
+- the encoder gains real temporal context, which is the point of the change.
+
+It is also nearly free to implement, because of how the two scans already work:
+
+| component | today | block-causal |
+|---|---|---|
+| forward Mamba scan | over 196 tokens | over all 1,960 — causal by construction, carries history across frames |
+| reverse Mamba scan | over 196 tokens | **reshape to (B*10, 196, D)**, flip, scan, flip back — stays inside its own frame |
+| attention layer (1 of 10) | non-causal over 196 | block-causal mask: frame `f` attends to frames `≤ f`, fully within them |
+
+The reverse scan restriction is a `reshape`, not a kernel change. (It is the same locality idea
+as LBMamba, arXiv 2506.15976 — rejected earlier on speed as a kernel optimisation, required here
+for correctness.)
+
+### The residual risk this does not remove
+
+With block-causal encoding, `emb[t+1]` shares most of its input with `emb[t]` (frames `0…t`
+overlap). A predictor can score well by **copying `emb[t]`** without modelling dynamics. The loss
+falls, the model is useless. This is why the cost function has to get more stringent — see §4.
+It must be reported against the copy baseline, or it cannot be interpreted.
+
+---
+
+## 1. `module.py:JambaEncoder`
+
+The real work. Current signature takes `(N, C, H, W)` and returns one pooled vector.
+
+- accept `(N, F, C, H, W)`; patch-embed per frame; concatenate to `(N, F*196, D)`
+- **two position embeddings**: the existing patch embedding (196) plus a new **frame** embedding
+  (F). Without the second, the stack cannot tell frame boundaries apart.
+- `_interpolate_pos_encoding` assumes a square grid via `int(num_positions ** 0.5)`. At 1,960
+  tokens that is 44.27 and it silently produces a wrong grid. Must operate on the per-frame
+  patch grid only.
+- `max_position_embeddings=num_patches` → `F * num_patches`.
+- **output `(N, F, output_dim)`** — mean-pool within each frame's own 196-token span, not over
+  the whole window. Pooling the window would collapse temporal resolution by 10x and change what
+  the predictor predicts.
+- replace the naive double pass (`self.jamba(...)` twice, lines 446–447) with the batched
+  bidirectional mixer from `benchmark_seq_scaling.py`, and call `sscanop2.register()` +
+  `PAD_SCAN=True` at construction.
+
+**Config mismatch to reconcile:** `module.py` uses `mamba_expand=2`; every crossover measurement
+was taken at `mamba_expand=1` with `hidden_size=288`. At expand=2 the scan cost doubles and 1,960
+is no longer the right window. Port at expand=1, or re-measure. Do not assume.
+
+## 2. `jepa.py:encode()`
+
+Cannot flatten `(b t) -> ...` any more — that is exactly what makes the encoder per-frame. It
+must hand the encoder a window and receive `(B, F, D)`. `last_hidden_state[:, 0]` as the
+"CLS slot" contract goes away; either return `(N*F, 1, D)` to preserve it, or update both call
+sites. Preserving it is less invasive and keeps `ConvEncoder` a valid drop-in.
+
+## 3. Data
+
+`T` per sample must be at least `F + ctx_len + n_preds`, contiguous, with `frameskip` respected.
+Window sampling has to be added; today the loader only needs enough frames for the predictor.
+
+**Memory is the binding constraint, not speed.** Measured at batch 16, 10 frames: **5.68 GB** for
+the encoder alone. Batch 128 extrapolates past 45 GB — over an A100-40GB before the predictor,
+projector and targets are counted. Expect real batch 8–16 windows plus gradient accumulation, and
+note that 16 windows is already 160 frames, so it is not as small as it sounds.
+
+## 4. The cost function — `jepa.py:criterion()`
+
+Today: MSE against the goal embedding at the **last step only**.
+
+```python
+cost = F.mse_loss(pred_emb[..., -1:, :], goal_emb[..., -1:, :].detach(), reduction="none")
+```
+
+Multi-frame encoding makes a stricter cost *expressible*, and §0 makes it *necessary*:
+
+1. **Goal as a window, not a still.** With a 10-frame encoder the goal can be a short clip, so
+   the cost measures reaching a goal *behaviour* (pose **and** motion) instead of a static pose.
+   This is the change multi-frame actually justifies — it is not available to a per-frame encoder.
+2. **Whole-trajectory, not endpoint.** Score every step of the rollout against the goal window,
+   not just `[-1:]`. Endpoint-only cost is indifferent to how you got there.
+3. **Scale-invariant distance.** Raw summed MSE rewards shrinking embedding norms. Cosine or
+   per-dimension standardised distance removes that.
+4. **Report against the copy baseline.** Always log the cost of the "predict no change"
+   trajectory alongside the model's. If the model does not beat it by a clear margin, the
+   §0 residual shortcut has happened and the number means nothing.
+
+(4) is not optional decoration. Without it there is no way to distinguish a working world model
+from a well-regularised identity function.
+
+## 5. Rollout and eval
+
+`rollout()` encodes the initial observation once and then runs the predictor autoregressively in
+embedding space. Block-causal encoding is consistent with this (`emb[t]` needs only frames `≤ t`),
+but the initial encode now needs a full `F`-frame window rather than a single frame, and
+`history_size=3` interacts with `F`. `eval.py`'s `plan_config.horizon`, `action_block` and
+`goal_offset_steps` all assume single-frame goals and need revisiting against §4.1.
+
+## 6. The honesty check on all of this
+
+Joint 10-frame encoding is **not** justified against the current pipeline on speed. Ten separate
+196-token encodes are linear in frames; one 1,960-token encode is not cheaper by construction.
+The crossover result says Jamba beats **a ViT doing the same joint encoding** — it does not say
+joint encoding beats per-frame encoding.
+
+What makes the change defensible on cost is a separate measured fact: short sequences waste the
+GPU. At batch 16, ViT at L=196 sustains ~362k tokens/s, while Jamba at L=1,960 sustains ~502k —
+so joint 10-frame Jamba encoding is roughly **1.4x more throughput per frame** than the per-frame
+pipeline it replaces. That is the honest efficiency claim. The real justification is capability:
+temporal context inside the representation.
+
+Any comparison reported after this change must put the ViT baseline on the same window size.
