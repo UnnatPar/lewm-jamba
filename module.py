@@ -378,8 +378,15 @@ class JambaEncoder(nn.Module):
         mamba_d_conv=4,
         mamba_expand=2,
         max_frames=10,
+        bidir_mode="inner",
     ):
         super().__init__()
+        # "inner": bidirectionality inside each mamba mixer (Vision Mamba style). in_proj,
+        #   out_proj and the MLP run once; only conv1d and the scan see both directions.
+        # "outer": the original -- run the whole stack twice and sum. Same parameters, ~1.9x
+        #   the FLOPs, because 95% of a layer is direction-agnostic and got computed twice.
+        assert bidir_mode in ("inner", "outer"), bidir_mode
+        self.bidir_mode = bidir_mode
         assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
         self.patch_size = patch_size
         self.max_frames = max_frames
@@ -416,6 +423,12 @@ class JambaEncoder(nn.Module):
         )
         self.jamba = JambaModel(config).to(torch.bfloat16)
         self.jamba.embed_tokens.requires_grad_(False)  # unused: bypassed via inputs_embeds
+        if bidir_mode == "inner":
+            import bidir
+            n = bidir.apply_to(self.jamba)
+            # A silent zero here would leave a unidirectional encoder that trains fine and
+            # looks fine, so it is worth an assert rather than a log line.
+            assert n == num_hidden_layers - 1, f"patched {n} mixers, expected mamba layers"
         self.head = nn.Linear(hidden_size, output_dim)
 
     def _interpolate_pos_encoding(self, x, height, width):
@@ -469,12 +482,15 @@ class JambaEncoder(nn.Module):
         x = x.reshape(n, f * p, -1)                            # (N, F*P, D)
 
         x = x.to(torch.bfloat16)
-        # Both directions in one call. Two sequential batch-N calls leave the GPU idle between
-        # them; one batch-2N call is the same arithmetic with the launch overhead paid once.
-        both = torch.cat([x, x.flip(dims=[1])], dim=0)
-        out = self.jamba(inputs_embeds=both).last_hidden_state
-        out_fwd, out_bwd = out.chunk(2, dim=0)
-        out = out_fwd + out_bwd.flip(dims=[1])  # re-align backward pass to forward token order
+        if self.bidir_mode == "inner":
+            # Each mixer already scans both directions internally, so one pass through the
+            # stack is the whole encoder.
+            out = self.jamba(inputs_embeds=x, use_cache=False).last_hidden_state
+        else:
+            both = torch.cat([x, x.flip(dims=[1])], dim=0)
+            out = self.jamba(inputs_embeds=both, use_cache=False).last_hidden_state
+            out_fwd, out_bwd = out.chunk(2, dim=0)
+            out = out_fwd + out_bwd.flip(dims=[1])  # re-align backward to forward token order
 
         # Pool WITHIN each frame's own P-token span, never across the window. Pooling the whole
         # window would collapse F frames to one vector and dilute the frame being predicted to
