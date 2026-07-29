@@ -379,6 +379,7 @@ class JambaEncoder(nn.Module):
         mamba_expand=2,
         max_frames=10,
         bidir_mode="inner",
+        mixer_impl="unfused",
     ):
         super().__init__()
         # "inner": bidirectionality inside each mamba mixer (Vision Mamba style). in_proj,
@@ -386,7 +387,12 @@ class JambaEncoder(nn.Module):
         # "outer": the original -- run the whole stack twice and sum. Same parameters, ~1.9x
         #   the FLOPs, because 95% of a layer is direction-agnostic and got computed twice.
         assert bidir_mode in ("inner", "outer"), bidir_mode
-        self.bidir_mode = bidir_mode
+        # mixer_impl (inner mode only):
+        #   "unfused" -- keeps Jamba's dt/B/C RMSNorms. The safe default.
+        #   "fused"   -- mamba_inner_fn, one kernel per direction, but DROPS those three norms
+        #                (Jamba's fix for loss spikes). Larger function class, stability risk.
+        assert mixer_impl in ("unfused", "fused"), mixer_impl
+        self.bidir_mode, self.mixer_impl = bidir_mode, mixer_impl
         assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
         self.patch_size = patch_size
         self.max_frames = max_frames
@@ -425,7 +431,7 @@ class JambaEncoder(nn.Module):
         self.jamba.embed_tokens.requires_grad_(False)  # unused: bypassed via inputs_embeds
         if bidir_mode == "inner":
             import bidir
-            n = bidir.apply_to(self.jamba)
+            n = bidir.apply_to(self.jamba, impl=mixer_impl)
             # A silent zero here would leave a unidirectional encoder that trains fine and
             # looks fine, so it is worth an assert rather than a log line.
             assert n == num_hidden_layers - 1, f"patched {n} mixers, expected mamba layers"

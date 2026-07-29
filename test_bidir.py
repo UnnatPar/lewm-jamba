@@ -43,12 +43,13 @@ def check(name, ok, detail=""):
     return ok
 
 
-def build(mode, max_frames=10, expand=1):
+def build(mode, max_frames=10, expand=1, impl="unfused"):
     return mod.JambaEncoder(
         image_size=IMG, output_dim=EMB, hidden_size=HID, intermediate_size=1152,
         num_hidden_layers=10, num_attention_heads=8, num_key_value_heads=4,
         attn_layer_period=10, attn_layer_offset=9, mamba_d_state=16, mamba_d_conv=4,
-        mamba_expand=expand, max_frames=max_frames, bidir_mode=mode).to(DEVICE)
+        mamba_expand=expand, max_frames=max_frames, bidir_mode=mode,
+        mixer_impl=impl).to(DEVICE)
 
 
 def ref_forward(mixer, h):
@@ -169,6 +170,58 @@ def main():
               f"far={far:.3e} near={near:.3e} ratio={far / max(near, 1e-12):.5f}")
         del e
 
+    print("\n4b. fused mixer (mamba_inner_fn, norms dropped)")
+    fe = build("inner", 10, 1, impl="fused")
+    fmix = next(m for m in fe.jamba.modules() if type(m).__name__ == "JambaMambaMixer")
+    hf2 = torch.randn(2, 392, HID, device=DEVICE, dtype=torch.bfloat16)
+    with torch.no_grad():
+        got = fmix.cuda_kernels_forward(hf2)
+        # Reference: the unfused path with the SAME norms dropped. If these agree, the fusion
+        # is faithful; any remaining difference vs the normed path is the intended function
+        # change, not a kernel bug. Testing against the normed path would conflate the two.
+        proj = fmix.in_proj(hf2).transpose(1, 2)
+        xx, gg = proj.chunk(2, dim=1)
+        n2 = xx.size(0)
+        sb = bidir._scan_both(fmix,
+                              torch.cat([xx, xx.flip(-1)], 0).contiguous(),
+                              torch.cat([gg, gg.flip(-1)], 0).contiguous(),
+                              use_norms=False)
+        want = fmix.out_proj((sb[:n2] + sb[n2:].flip(-1)).transpose(1, 2))
+    sc = max(want.abs().max().item(), 1e-9)
+    df = (got - want).abs().max().item()
+    check("fused == unfused with norms dropped", df <= 2e-2 * sc, f"max|diff|={df:.3e} (scale {sc:.3f})")
+
+    with torch.no_grad():
+        normed = fmix.out_proj(
+            (lambda s: s[:n2] + s[n2:].flip(-1))(
+                bidir._scan_both(fmix,
+                                 torch.cat([xx, xx.flip(-1)], 0).contiguous(),
+                                 torch.cat([gg, gg.flip(-1)], 0).contiguous(),
+                                 use_norms=True)).transpose(1, 2))
+    dn = (want - normed).abs().max().item()
+    # Not a failure -- just confirming dropping the norms really does change the function, so
+    # the equivalence above is a meaningful test and not vacuously true.
+    check("dropping the norms does change the function", dn > 1e-3 * sc,
+          f"normed vs un-normed max|diff|={dn:.3e}")
+
+    print("\n4c. fused path trains without blowing up (the flagged risk)")
+    opt = torch.optim.AdamW(fe.parameters(), lr=1e-4)
+    losses, bad = [], []
+    for i in range(12):
+        px = torch.randn(2, 4, 3, IMG, IMG, device=DEVICE)
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = fe(px).last_hidden_state.float().pow(2).mean()
+        loss.backward()
+        gn = torch.nn.utils.clip_grad_norm_(fe.parameters(), 1.0)
+        opt.step()
+        losses.append(loss.item())
+        if not (torch.isfinite(loss) and torch.isfinite(gn)):
+            bad.append(i)
+    check("12 steps, loss and grad norm all finite", not bad,
+          f"loss {losses[0]:.4f} -> {losses[-1]:.4f}" if not bad else f"nonfinite at steps {bad}")
+    del fe, fmix
+
     print("\n5. parameter counts identical")
     pi = sum(p.numel() for p in build("inner").parameters())
     po = sum(p.numel() for p in build("outer").parameters())
@@ -185,16 +238,20 @@ def main():
         vh, vp = c2.match_hidden(jp, 12)
         print(f"\n  expand={expand}: Jamba {jp:,}  ViT(hidden={vh}) {vp:,}", flush=True)
         print(f"  {'frames':>6} {'tokens':>7} {'ViT':>8} {'outer':>8} {'inner':>8} "
-              f"{'in/out':>7} {'vs ViT':>8}", flush=True)
+              f"{'fused':>8} {'fu/in':>7} {'vs ViT':>8}", flush=True)
         for f in (8, 10, 12):
             try:
-                v, _ = c2.rate(lambda: c2.ViTEncoder(vh, f), f, 8)
-                o, _ = c2.rate(lambda: build("outer", f, expand), f, 8)
-                i, _ = c2.rate(lambda: build("inner", f, expand), f, 8)
+                # Two repeats, best of, because single measurements were bouncing +-5% and the
+                # effects being chased are the same size.
+                r = lambda b: max(c2.rate(b, f, 8)[0] for _ in range(2))
+                v = r(lambda: c2.ViTEncoder(vh, f))
+                o = r(lambda: build("outer", f, expand))
+                i = r(lambda: build("inner", f, expand))
+                fu = r(lambda: build("inner", f, expand, impl="fused"))
             except torch.cuda.OutOfMemoryError:
                 print(f"  {f:>6} OOM", flush=True); torch.cuda.empty_cache(); continue
-            print(f"  {f:>6} {f * 196:>7} {v:>8.2f} {o:>8.2f} {i:>8.2f} {i / o:>7.2f}x "
-                  f"{i / v:>7.3f}{'  JAMBA WINS' if i > v else ''}", flush=True)
+            print(f"  {f:>6} {f * 196:>7} {v:>8.2f} {o:>8.2f} {i:>8.2f} {fu:>8.2f} "
+                  f"{fu / i:>6.2f}x {fu / v:>7.3f}{'  JAMBA WINS' if fu > v else ''}", flush=True)
     print("\nALL CORRECTNESS PASSED\n")
     return 0
 

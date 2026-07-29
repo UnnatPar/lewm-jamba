@@ -33,17 +33,23 @@ import torch
 from transformers.models.jamba import modeling_jamba as mj
 
 
-def _scan_both(self, x, gate):
-    """conv -> x_proj -> dt -> selective_scan, on (2B, d_inner, L) holding both directions."""
+def _scan_both(self, x, gate, use_norms=True):
+    """conv -> x_proj -> dt -> selective_scan, on (2B, d_inner, L) holding both directions.
+
+    use_norms=False drops Jamba's dt/B/C RMSNorms, matching what the fused kernel computes.
+    That exists so the fused path can be tested for exact equivalence against an unfused
+    reference -- otherwise a fusion bug and the intended function change are indistinguishable.
+    """
     conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
     x = mj.causal_conv1d_fn(x, conv_weights, self.conv1d.bias, activation=self.activation)
 
     ssm_parameters = self.x_proj(x.transpose(1, 2))
     time_step, B, C = torch.split(
         ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1)
-    time_step = self.dt_layernorm(time_step)
-    B = self.b_layernorm(B)
-    C = self.c_layernorm(C)
+    if use_norms:
+        time_step = self.dt_layernorm(time_step)
+        B = self.b_layernorm(B)
+        C = self.c_layernorm(C)
 
     # Upstream swaps dt_proj.bias to zero and back under no_grad on every call, purely to reuse
     # nn.Linear.forward for quantization support. That is two extra device ops per layer per
@@ -90,16 +96,56 @@ def bidirectional_forward(self, hidden_states, cache_params=None, attention_mask
     return self.out_proj((fwd + bwd.flip(-1)).transpose(1, 2))
 
 
-def apply_to(model):
+def bidirectional_fused_forward(self, hidden_states, cache_params=None, attention_mask=None,
+                                **kw):
+    """Same bidirectional structure, but each direction goes through mamba_inner_fn.
+
+    mamba_inner_fn fuses conv -> x_proj -> dt_proj -> scan -> gate -> out_proj into one kernel.
+    Upstream cannot use it because Jamba's dt/B/C RMSNorms sit in the middle of that chain, so
+    this path DROPS those three norms (450 parameters across the 9 mixers, 0.003% of the model).
+    That strictly enlarges the function class -- an RMSNorm is a constraint, and no setting of
+    its weights recovers un-normalised dt/B/C magnitudes -- but it removes the stabiliser Jamba
+    added for loss spikes, so watch for NaNs early rather than trusting it.
+
+    out_proj is inside the fused kernel, so it runs per direction rather than once: duplicated
+    work goes from ~4.8% to ~11% of a layer. out_proj is linear, so summing after it is exactly
+    equivalent to summing before. in_proj and the MLP still run once.
+
+    Note this path cannot use sscanop2's chunk padding -- mamba_inner_fn has its own fused CUDA
+    path and never routes through selective_scan_fn. Measured as within noise at 1,960 tokens,
+    but it does make the two optimisations mutually exclusive rather than additive.
+    """
+    if (cache_params is not None and hidden_states.size(1) == 1
+            and getattr(cache_params, "has_previous_state", lambda _i: False)(self.layer_idx)):
+        raise NotImplementedError("bidir: incremental decode cannot be bidirectional.")
+
+    xz = self.in_proj(hidden_states).transpose(1, 2)
+    n = xz.size(0)
+    y = mj.mamba_inner_fn(
+        torch.cat([xz, xz.flip(-1)], 0).contiguous(),
+        self.conv1d.weight, self.conv1d.bias,
+        self.x_proj.weight, self.dt_proj.weight,
+        self.out_proj.weight, self.out_proj.bias,
+        -torch.exp(self.A_log.float()),
+        None, None,                       # B and C come from x_proj inside the kernel
+        self.D.float(),
+        delta_bias=self.dt_proj.bias.float(),
+        delta_softplus=True,
+    )                                     # (2B, L, hidden_size)
+    return y[:n] + y[n:].flip(1)
+
+
+def apply_to(model, impl="unfused"):
     """Bind the bidirectional mixer forward onto every JambaMambaMixer in `model`.
 
     Per-instance, so two encoders with different bidir_mode can coexist in one process.
     Returns the number of mixers patched -- callers should assert it is nonzero, since a
     silent zero would mean a unidirectional encoder that still trains and still looks fine.
     """
+    fn = {"unfused": bidirectional_forward, "fused": bidirectional_fused_forward}[impl]
     n = 0
     for m in model.modules():
         if isinstance(m, mj.JambaMambaMixer):
-            m.cuda_kernels_forward = types.MethodType(bidirectional_forward, m)
+            m.cuda_kernels_forward = types.MethodType(fn, m)
             n += 1
     return n
