@@ -1,8 +1,16 @@
 # Multi-frame Jamba encoder — what changes, and the one thing that would break silently
 
-Measured 2026-07-29. Window size is settled: **10 frames = 1,960 tokens**, the largest multiple
-of 196 that fits under the scan's 2,048 chunk boundary. Jamba beats the matched ViT by 11%
-there; at 11 frames it spills to a 4,096 chunk and loses (0.854x). See the ledger.
+Measured 2026-07-29. Window size: **10 frames = 1,960 tokens**, the largest multiple of 196 that
+fits under the scan's 2,048 chunk boundary.
+
+> **RETRACTED 2026-07-29 (later the same day): "Jamba beats the matched ViT by 11% there" is
+> false for the encoder that actually trains.** That figure came from a bare mixer on synthetic
+> hidden states under `torch.compile`. Measured with the real `module.JambaEncoder` against a
+> parameter-matched ViT (`crossover2.py`), Jamba loses at every window from 784 to 2,352 tokens:
+> **0.572x at expand=1, 0.430x at expand=2**, and the ratio is flat in sequence length, meaning
+> the crossover is far beyond anything measured. `torch.compile` makes it worse, not better.
+> See the ledger entry. **The efficiency claim in §6 is withdrawn.** The 2,048-chunk reasoning
+> for choosing 10 over 9 or 11 frames still holds; the "Jamba wins here" reasoning does not.
 
 ---
 
@@ -202,10 +210,19 @@ Joint 10-frame encoding is **not** justified against the current pipeline on spe
 The crossover result says Jamba beats **a ViT doing the same joint encoding** — it does not say
 joint encoding beats per-frame encoding.
 
-What makes the change defensible on cost is a separate measured fact: short sequences waste the
+~~What makes the change defensible on cost is a separate measured fact: short sequences waste the
 GPU. At batch 16, ViT at L=196 sustains ~362k tokens/s, while Jamba at L=1,960 sustains ~502k —
-so joint 10-frame Jamba encoding is roughly **1.4x more throughput per frame** than the per-frame
-pipeline it replaces. That is the honest efficiency claim. The real justification is capability:
-temporal context inside the representation.
+so joint 10-frame Jamba encoding is roughly 1.4x more throughput per frame than the per-frame
+pipeline it replaces.~~
+
+**Withdrawn 2026-07-29.** Those throughput figures are from the bare mixer, not the real
+encoder. Measured on the real thing (`mfprobe.py`, full JEPA training step): **0.53 hr/epoch,
+53 hours for the configured 100 epochs**, against a per-frame baseline that trained in a few
+hours. The change is roughly **15–25x more expensive**, not 1.4x cheaper.
+
+**So the justification is capability alone: temporal context inside the representation.** There
+is no efficiency argument for this architecture, and none should be made in the writeup. Whether
+the capability is worth 15–25x is an empirical question that `copy_ratio` and downstream planning
+performance have to answer — it cannot be argued from the cost side.
 
 Any comparison reported after this change must put the ViT baseline on the same window size.
