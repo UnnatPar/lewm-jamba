@@ -43,15 +43,20 @@ FRAMES = [int(x) for x in os.environ.get("CROSS2_FRAMES", "4,6,8,10,12").split("
 # torch.compile(mode="reduce-overhead"), and cudagraphs is precisely the fix for Jamba's many
 # small mamba kernel launches -- so the two are different questions and both need answering.
 COMPILE = os.environ.get("CROSS2_COMPILE", "0") == "1"
+# The one variable that could account for the whole gap. Every historical crossover number was
+# at expand=1; module.py defaults to 2, which doubles the scan's inner width and so roughly
+# doubles the mamba layers' cost. Sweeping it turns "Jamba loses" into a decision the numbers
+# can actually inform: capacity at expand=2 versus speed at expand=1.
+EXPANDS = [int(x) for x in os.environ.get("CROSS2_EXPANDS", "2").split(",")]
 STEPS, WARM = 15, 5
 
 
-def jamba(max_frames):
+def jamba(max_frames, expand=2):
     return mod.JambaEncoder(
         image_size=IMG, patch_size=PATCH, output_dim=EMB, hidden_size=288,
         intermediate_size=1152, num_hidden_layers=10, num_attention_heads=8,
         num_key_value_heads=4, attn_layer_period=10, attn_layer_offset=9,
-        mamba_d_state=16, mamba_d_conv=4, mamba_expand=2, max_frames=max_frames)
+        mamba_d_state=16, mamba_d_conv=4, mamba_expand=expand, max_frames=max_frames)
 
 
 class ViTEncoder(nn.Module):
@@ -131,21 +136,25 @@ def main():
     if not co.verify(orig, shim):
         print("STOPPING: equivalence failed"); return
 
-    jp = sum(p.numel() for p in jamba(max(FRAMES)).parameters())
-    h, vp = match_hidden(jp, max(FRAMES))
-    print(f"\n  Jamba(expand=2) {jp:,} params  vs  ViT(hidden={h}) {vp:,} params "
-          f"({100 * (vp - jp) / jp:+.1f}%)   compile={COMPILE}\n", flush=True)
-    out = {}
-    for batch in BATCHES:
-        print(f"\n=== batch={batch} ({batch} windows/step) ===", flush=True)
+    out, meta = {}, {}
+    for expand in EXPANDS:
+      # Re-match the ViT per expand. Reusing one baseline across both would put Jamba at
+      # expand=1 against a ViT sized for expand=2 and silently flatter the smaller model.
+      jp = sum(p.numel() for p in jamba(max(FRAMES), expand).parameters())
+      h, vp = match_hidden(jp, max(FRAMES))
+      meta[str(expand)] = {"jamba_params": jp, "vit_hidden": h, "vit_params": vp}
+      print(f"\n### mamba_expand={expand}: Jamba {jp:,} vs ViT(hidden={h}) {vp:,} "
+            f"({100 * (vp - jp) / jp:+.1f}%)  compile={COMPILE}", flush=True)
+      for batch in BATCHES:
+        print(f"\n=== expand={expand} batch={batch} ({batch} windows/step) ===", flush=True)
         print(f"  {'frames':>6} {'tokens':>7} {'pad':>6} {'ViT it/s':>9} {'Jamba it/s':>11} "
               f"{'ratio':>7} {'J GB':>6}", flush=True)
         first_vit = None
         for f in FRAMES:
             L = f * PER_FRAME
             row = {}
-            for name, build in (("vit", lambda f=f: ViTEncoder(h, f)),
-                                ("jamba", lambda f=f: jamba(f))):
+            for name, build in (("vit", lambda f=f, h=h: ViTEncoder(h, f)),
+                                ("jamba", lambda f=f, e=expand: jamba(f, e))):
                 try:
                     row[name], row[name + "_gb"] = rate(build, f, batch)
                 except torch.cuda.OutOfMemoryError:
@@ -157,17 +166,16 @@ def main():
                 print(f"  {f:>6} {L:>7} {co._pad_len(L):>6} {row['vit']:>9.2f} "
                       f"{row['jamba']:>11.2f} {r:>7.3f} {row['jamba_gb']:>6.2f}"
                       f"{'   JAMBA WINS' if r > 1 else ''}", flush=True)
-            out[f"{batch}|{f}"] = row
+            out[f"{expand}|{batch}|{f}"] = row
         # Compute-bound or launch-bound? If the ViT barely slows over a 3x token increase, its
         # quadratic term is not what is being timed and no crossover can be read off this.
-        last_vit = out[f"{batch}|{FRAMES[-1]}"].get("vit")
+        last_vit = out[f"{expand}|{batch}|{FRAMES[-1]}"].get("vit")
         if first_vit and last_vit:
             drop = 100 * (1 - last_vit / first_vit)
             print(f"  ViT slowdown {FRAMES[0]}->{FRAMES[-1]} frames: {drop:.0f}%  "
                   f"({'LAUNCH-BOUND, ratios meaningless' if drop < 25 else 'compute-bound'})",
                   flush=True)
-    print("CROSS2_JSON " + json.dumps({"jamba_params": jp, "vit_hidden": h,
-                                       "vit_params": vp, "rows": out}), flush=True)
+    print("CROSS2_JSON " + json.dumps({"meta": meta, "rows": out}), flush=True)
 
 
 # Guarded so a runner can set CROSS2_* in os.environ first and then
