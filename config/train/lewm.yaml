@@ -27,13 +27,15 @@ trainer:
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
-  # Each sample is now history_size+num_preds windows of window_size*196 tokens, so the
-  # encoder's activation memory per sample is ~12x the per-frame version. 128 in one shot is
-  # ~200 GB. Accumulate instead so the effective batch, and therefore the LR, stay put.
-  accumulate_grad_batches: 8
+  # Measured on an A100-40GB (mfprobe, 2026-07-29): batch 4 -> 18.8 GB, batch 8 -> 37.4 GB,
+  # batch 16 -> OOM. Throughput is FLAT across that range (13.3 vs 13.0 samp/s) because 20
+  # windows of 1,960 tokens in both scan directions already saturates the GPU -- a bigger
+  # batch buys memory pressure and nothing else. So take the small one and accumulate to keep
+  # the effective batch, and therefore the LR, where the paper had them.
+  accumulate_grad_batches: 32
 
 loader:
-  batch_size: 16
+  batch_size: 4
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3
