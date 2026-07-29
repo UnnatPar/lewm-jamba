@@ -377,10 +377,12 @@ class JambaEncoder(nn.Module):
         mamba_d_state=16,
         mamba_d_conv=4,
         mamba_expand=2,
+        max_frames=10,
     ):
         super().__init__()
         assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
         self.patch_size = patch_size
+        self.max_frames = max_frames
         grid_size = image_size // patch_size
         num_patches = grid_size * grid_size
 
@@ -388,6 +390,12 @@ class JambaEncoder(nn.Module):
             in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
         )
         self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, hidden_size) * 0.02)
+        # Two position signals, not one. `pos_embedding` says where in the image a token is;
+        # without a second one saying which frame it came from, a 1,960-token window is just an
+        # unordered bag of ten frames and the stack cannot tell a boundary from a patch step.
+        self.frame_embedding = nn.Parameter(
+            torch.randn(1, max_frames, 1, hidden_size) * 0.02
+        )
 
         config = JambaConfig(
             vocab_size=8,  # unused: we bypass embed_tokens via inputs_embeds
@@ -404,7 +412,7 @@ class JambaEncoder(nn.Module):
             mamba_d_conv=mamba_d_conv,
             mamba_expand=mamba_expand,
             use_mamba_kernels=True,
-            max_position_embeddings=num_patches,
+            max_position_embeddings=max_frames * num_patches,
         )
         self.jamba = JambaModel(config).to(torch.bfloat16)
         self.jamba.embed_tokens.requires_grad_(False)  # unused: bypassed via inputs_embeds
@@ -429,24 +437,47 @@ class JambaEncoder(nn.Module):
 
     def forward(self, pixels, interpolate_pos_encoding=True):
         """
-        pixels: (N, C, H, W)
-        returns: _EncoderOutput with last_hidden_state of shape (N, 1, output_dim)
-        """
-        _, _, height, width = pixels.shape
-        x = self.patch_embed(pixels).flatten(2).transpose(1, 2)  # (N, L, hidden_size)
+        pixels: (N, F, C, H, W) -- a window of F frames encoded *jointly*, or (N, C, H, W)
+                for a single frame, which is treated as F=1 so single-frame callers keep working.
 
+        returns: _EncoderOutput with last_hidden_state of shape (N, F, output_dim) -- one
+                 embedding per frame slot. Slot f is not "frame f's embedding"; it is frame f
+                 as seen through the whole window, and re-encoding a shifted window gives that
+                 frame a different vector. That is the point of the joint encode.
+        """
+        if pixels.dim() == 4:
+            pixels = pixels.unsqueeze(1)
+        n, f, _, height, width = pixels.shape
+        assert f <= self.max_frames, (
+            f"window of {f} frames exceeds max_frames={self.max_frames}; frame_embedding has "
+            "no row for the extra frames"
+        )
+
+        # Patch-embed every frame in the window as one batch, then re-separate. The spatial
+        # position embedding is added per frame, on the per-frame patch grid -- doing it after
+        # concatenation would hand _interpolate_pos_encoding F*196 positions and it would take
+        # the square root of that to guess a grid, which is not an integer and fails silently.
+        x = self.patch_embed(pixels.flatten(0, 1)).flatten(2).transpose(1, 2)  # (N*F, P, D)
         pos = (
             self._interpolate_pos_encoding(x, height, width)
             if interpolate_pos_encoding
             else self.pos_embedding
         )
         x = x + pos
+        p = x.size(1)
+        x = x.view(n, f, p, -1) + self.frame_embedding[:, :f]  # temporal position
+        x = x.reshape(n, f * p, -1)                            # (N, F*P, D)
 
         x = x.to(torch.bfloat16)
-        out_fwd = self.jamba(inputs_embeds=x).last_hidden_state
-        out_bwd = self.jamba(inputs_embeds=x.flip(dims=[1])).last_hidden_state
+        # Both directions in one call. Two sequential batch-N calls leave the GPU idle between
+        # them; one batch-2N call is the same arithmetic with the launch overhead paid once.
+        both = torch.cat([x, x.flip(dims=[1])], dim=0)
+        out = self.jamba(inputs_embeds=both).last_hidden_state
+        out_fwd, out_bwd = out.chunk(2, dim=0)
         out = out_fwd + out_bwd.flip(dims=[1])  # re-align backward pass to forward token order
 
-        pooled = out.mean(dim=1).to(self.head.weight.dtype)  # (N, hidden_size)
-        pooled = self.head(pooled)  # (N, output_dim)
-        return _EncoderOutput(pooled.unsqueeze(1))  # (N, 1, output_dim)
+        # Pool WITHIN each frame's own P-token span, never across the window. Pooling the whole
+        # window would collapse F frames to one vector and dilute the frame being predicted to
+        # 1/F of the target signal.
+        out = out.view(n, f, p, -1).mean(dim=2).to(self.head.weight.dtype)
+        return _EncoderOutput(self.head(out))  # (N, F, output_dim)

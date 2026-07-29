@@ -17,6 +17,8 @@ class JEPA(nn.Module):
         action_encoder,
         projector=None,
         pred_proj=None,
+        window_size: int = 1,
+        window_stride: int = 1,
     ):
         super().__init__()
 
@@ -25,22 +27,54 @@ class JEPA(nn.Module):
         self.action_encoder = action_encoder
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
+        # window_size=1 reproduces the original per-frame encoder exactly, so ConvEncoder and
+        # ViT stay drop-in and the old configs keep their old behaviour.
+        self.window_size = window_size
+        self.window_stride = window_stride
 
     def encode(self, info):
         """Encode observations and actions into embeddings.
         info: dict with pixels and action keys
+
+        With window_size=W>1 the T frames are cut into overlapping windows of W and each window
+        is encoded jointly. A window contributes ONE timestep to `emb`: the last slot, i.e. its
+        newest frame seen in the context of the W-1 before it. Mean-pooling the window instead
+        would spread the frame being predicted across all W and make the target mostly overlap.
+
+        Windows and frames are offset by W-1: emb[k] is the representation of frame
+        k*stride + W-1, so the existing ctx=emb[:, :n] / tgt=emb[:, 1:] slicing in train.py
+        still pairs each context with the frame one step past it.
         """
 
         pixels = info['pixels'].float()
-        b = pixels.size(0)
-        pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
-        output = self.encoder(pixels, interpolate_pos_encoding=True)
-        pixels_emb = output.last_hidden_state[:, 0]  # cls token
+        b, t = pixels.shape[:2]
+        w, s = self.window_size, self.window_stride
+
+        if w == 1:
+            windows = rearrange(pixels, "b t ... -> (b t) ...")  # 4D: ViT/Conv take it as-is
+            n_win = t
+        else:
+            n_win = (t - w) // s + 1
+            assert n_win >= 1, (
+                f"need at least window_size={w} frames to form one window, got T={t}. "
+                f"num_steps must be >= num_preds + history_size + window_size - 1."
+            )
+            idx = (torch.arange(n_win, device=pixels.device)[:, None] * s
+                   + torch.arange(w, device=pixels.device))
+            windows = pixels[:, idx].flatten(0, 1)  # (B*n_win, W, C, H, W)
+
+        output = self.encoder(windows, interpolate_pos_encoding=True)
+        pixels_emb = output.last_hidden_state[:, -1]  # last slot (== the only slot when W=1)
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
         if "action" in info:
-            info["act_emb"] = self.action_encoder(info["action"])
+            act = info["action"]
+            if w > 1:
+                # Pair each window with the action taken at its newest frame -- the one that
+                # carries it to the frame it is being asked to predict.
+                act = act[:, w - 1 :: s][:, :n_win]
+            info["act_emb"] = self.action_encoder(act)
 
         return info
 

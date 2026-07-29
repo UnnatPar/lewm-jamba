@@ -12,7 +12,14 @@ train_split: 0.9
 seed: 3072
 img_size: 224
 embed_dim: 192
-history_size: 3
+history_size: 4
+
+# Frames encoded jointly per timestep. 10 * 196 = 1,960 tokens, the largest multiple of a
+# 196-token frame that still fits under the scan's 2,048 chunk boundary -- 11 frames spills to
+# a 4,096 chunk and Jamba loses to the matched ViT. See MULTIFRAME_PLAN.md.
+# window_size: 1 restores the original per-frame encoder exactly.
+window_size: 10
+window_stride: 1
 
 trainer:
   max_epochs: 100
@@ -20,9 +27,13 @@ trainer:
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
+  # Each sample is now history_size+num_preds windows of window_size*196 tokens, so the
+  # encoder's activation memory per sample is ~12x the per-frame version. 128 in one shot is
+  # ~200 GB. Accumulate instead so the effective batch, and therefore the LR, stay put.
+  accumulate_grad_batches: 8
 
 loader:
-  batch_size: 128
+  batch_size: 16
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3

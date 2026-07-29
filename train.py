@@ -38,9 +38,20 @@ def lejepa_forward(self, batch, stage, cfg):
     # LeWM loss
     output["pred_loss"] = (pred_emb - tgt_emb).pow(2).mean()
     output["sigreg_loss"]= self.sigreg(emb.transpose(0, 1))
-    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]  
+    output["loss"] = output["pred_loss"] + lambd * output["sigreg_loss"]
 
-    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
+    # The copy baseline: what "predict no change" would score. With window encoding, ctx[k] and
+    # tgt[k] share window_size-1 of their window_size frames, so most of the target is already
+    # inside the context and a model that learns nothing about dynamics still drives pred_loss
+    # down. Without this number alongside it, pred_loss cannot be interpreted -- a falling curve
+    # is equally consistent with a working world model and a well-regularised identity function.
+    with torch.no_grad():
+        output["copy_loss"] = (ctx_emb - tgt_emb).pow(2).mean()
+        # >1 means the model beats copying; <=1 means it has not learned any dynamics.
+        output["copy_ratio"] = output["copy_loss"] / output["pred_loss"].clamp_min(1e-12)
+
+    losses_dict = {f"{stage}/{k}": v.detach()
+                   for k, v in output.items() if "loss" in k or k == "copy_ratio"}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
