@@ -14,11 +14,19 @@ img_size: 224
 embed_dim: 192
 history_size: 4
 
-# Frames encoded jointly per timestep. 10 * 196 = 1,960 tokens, the largest multiple of a
-# 196-token frame that still fits under the scan's 2,048 chunk boundary -- 11 frames spills to
-# a 4,096 chunk and Jamba loses to the matched ViT. See MULTIFRAME_PLAN.md.
+# Frames encoded jointly per timestep. 20 * 196 = 3,920 tokens.
+#
+# This is PAST THE CROSSOVER: measured 1.10x a parameter-matched ViT, where 10 frames (1,960
+# tokens) is only 0.89x. The crossover sits at ~3,300 tokens (17 frames) and 3,920 is the next
+# chunk-efficient window after 1,960 -- 3,920/4,096 = 95.7%, the same efficiency as 1,960/2,048,
+# which is why 12 or 16 frames are worse choices despite being longer than 10.
+#
+# It is also not more expensive than the original: 0.47 hr/epoch at batch 4 versus 0.53 for the
+# unoptimised 10-frame config, with double the temporal context.
+#
+# window_size: 10 is the cheap alternative at 0.25 hr/epoch, but loses to the matched ViT.
 # window_size: 1 restores the original per-frame encoder exactly.
-window_size: 10
+window_size: 20
 window_stride: 1
 
 trainer:
@@ -27,11 +35,10 @@ trainer:
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
-  # Measured on an A100-40GB (mfprobe, 2026-07-29): batch 4 -> 18.8 GB, batch 8 -> 37.4 GB,
-  # batch 16 -> OOM. Throughput is FLAT across that range (13.3 vs 13.0 samp/s) because 20
-  # windows of 1,960 tokens in both scan directions already saturates the GPU -- a bigger
-  # batch buys memory pressure and nothing else. So take the small one and accumulate to keep
-  # the effective batch, and therefore the LR, where the paper had them.
+  # Re-measured after the encoder optimisation (mfprobe2, A100-40GB, window 20): batch 4 gives
+  # 14.85 samp/s at 15.4 GB, and samples/s is flat from batch 2 to 6 (14.20 / 14.66 / 14.85 /
+  # 14.67) -- the card is saturated, so a bigger batch buys memory pressure and nothing else.
+  # Accumulate to hold the effective batch, and therefore the LR, where the paper had them.
   accumulate_grad_batches: 32
 
 loader:

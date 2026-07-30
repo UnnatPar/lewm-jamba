@@ -8,16 +8,33 @@ encoder:
   image_size: ${img_size}
   output_dim: ${embed_dim}
   hidden_size: 288
-  intermediate_size: 1152
+  # Optimised 2026-07-29 by sweep, holding SSM state and parameter count fixed. Scan cost splits
+  # into FLOPs (~d_inner*d_state, which IS the SSM state) and streaming (~d_inner, which is not),
+  # so halving d_inner and doubling d_state keeps state at 288*32 = 9216 -- identical to the old
+  # 576*16 -- while halving the streaming, conv, in_proj and out_proj. The parameters freed by
+  # expand 2->1 go into intermediate_size, where they are nearly free: halving the MLP bought only
+  # 1.05x despite it being 67% of the FLOPs. Net 15,497,346 params vs 15,497,922 before.
+  intermediate_size: 1424
   num_hidden_layers: 10
   num_attention_heads: 8
   num_key_value_heads: 4
+  # 1 attention layer measured optimal. 2 gives 0.827 and 5 gives 0.884, against 0.890 for 1 --
+  # with the cheaper mixer a mamba layer now costs less than an attention layer, so adding
+  # attention slows it down.
   attn_layer_period: 10
   attn_layer_offset: 9
-  mamba_d_state: 16
+  mamba_d_state: 32
   mamba_d_conv: 4
-  mamba_expand: 2
+  mamba_expand: 1
   max_frames: ${window_size}
+  # inner    : bidirectionality inside each mixer, not around the whole stack
+  # alternate: one direction per layer (even forward, odd backward). The stack stays
+  #            bidirectional through depth without any layer running two scans. Measured to
+  #            propagate backward slightly BETTER than per-layer bidirectional (0.002654 vs
+  #            0.002511) at 1.47x the speed. Uses mamba_inner_fn, which drops Jamba's dt/B/C
+  #            RMSNorms (450 params); 12-step stability check passed.
+  bidir_mode: inner
+  mixer_impl: alternate
 
 predictor:
   _target_: module.ARPredictor

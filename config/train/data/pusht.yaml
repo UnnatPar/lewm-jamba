@@ -2,7 +2,14 @@ dataset:
   # A window of W frames yields one timestep, so covering history_size + num_preds timesteps
   # needs W-1 extra frames on the front. W=1 collapses this to the original expression.
   num_steps: ${eval:'${num_preds} + ${history_size} + ${window_size} - 1'}
-  frameskip: 5
+  # 4, not 5, and this is forced by window_size=20 rather than chosen. num_steps is
+  # 1 + 4 + 20 - 1 = 24 frames per sample; at frameskip 5 that is 120 raw environment steps,
+  # the entire length of a PushT episode, leaving exactly one sampleable window per episode and
+  # no augmentation from start-position jitter. At 4 it is 96 raw steps, leaving ~24 start
+  # positions. The cost is that consecutive frames are 4 raw steps apart instead of 5, so
+  # next-step prediction is slightly easier -- watch copy_ratio in train.py, which is logged
+  # precisely to catch that. Reverting to window_size=10 allows frameskip 5 again (70 raw steps).
+  frameskip: 4
   name: pusht_expert_train.lance
   keys_to_load:
     - pixels

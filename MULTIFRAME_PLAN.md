@@ -3,14 +3,26 @@
 Measured 2026-07-29. Window size: **10 frames = 1,960 tokens**, the largest multiple of 196 that
 fits under the scan's 2,048 chunk boundary.
 
-> **RETRACTED 2026-07-29 (later the same day): "Jamba beats the matched ViT by 11% there" is
-> false for the encoder that actually trains.** That figure came from a bare mixer on synthetic
-> hidden states under `torch.compile`. Measured with the real `module.JambaEncoder` against a
-> parameter-matched ViT (`crossover2.py`), Jamba loses at every window from 784 to 2,352 tokens:
-> **0.572x at expand=1, 0.430x at expand=2**, and the ratio is flat in sequence length, meaning
-> the crossover is far beyond anything measured. `torch.compile` makes it worse, not better.
-> See the ledger entry. **The efficiency claim in §6 is withdrawn.** The 2,048-chunk reasoning
-> for choosing 10 over 9 or 11 frames still holds; the "Jamba wins here" reasoning does not.
+> **SUPERSEDED 2026-07-29 (late). The window is 20 frames / 3,920 tokens, and Jamba wins there.**
+>
+> Sequence of corrections, all in the ledger:
+> 1. The "11% win at 1,960" came from a bare mixer on synthetic hidden states under
+>    `torch.compile`. The real `module.JambaEncoder` measured **0.430x** at expand=2 — Jamba lost
+>    at every window from 784 to 2,352 tokens, with the ratio flat in length.
+> 2. A sweep of optimisations took 1,960 tokens from 0.430 to **0.892** with SSM state (9216/layer)
+>    and parameters (~15.50M) both held exactly. 1,960 could not be pushed to parity.
+> 3. **The crossover is ~3,300 tokens (17 frames).** At 20 frames / 3,920 tokens Jamba runs at
+>    **1.10x** the parameter-matched ViT, and 3,920 is chunk-efficient (95.7% of a 4,096
+>    allocation, the same as 1,960 of 2,048).
+> 4. **It is also cheaper than the original config**: 0.47 hr/epoch versus 0.53, with double the
+>    temporal context. So §6's efficiency claim is restored on a real measurement rather than
+>    withdrawn — but at 3,920 tokens, never at 1,960.
+>
+> The biggest single win was **alternating the scan direction by depth** (1.47x): even layers scan
+> forward, odd backward, so the stack is bidirectional through depth while no layer runs two scans.
+> It propagates backward slightly better than per-layer bidirectionality, measured.
+>
+> `window_size` is a config knob; 10 frames remains available at 0.25 hr/epoch and 0.89x.
 
 ---
 
@@ -215,14 +227,23 @@ GPU. At batch 16, ViT at L=196 sustains ~362k tokens/s, while Jamba at L=1,960 s
 so joint 10-frame Jamba encoding is roughly 1.4x more throughput per frame than the per-frame
 pipeline it replaces.~~
 
-**Withdrawn 2026-07-29.** Those throughput figures are from the bare mixer, not the real
-encoder. Measured on the real thing (`mfprobe.py`, full JEPA training step): **0.53 hr/epoch,
-53 hours for the configured 100 epochs**, against a per-frame baseline that trained in a few
-hours. The change is roughly **15–25x more expensive**, not 1.4x cheaper.
+**Restored 2026-07-29 (late), on a real measurement and at a different window.** Those original
+throughput figures were from the bare mixer and were not trustworthy. Measured on the real full
+JEPA training step (`mfprobe2.py`, A100-40GB, batch 4), after the optimisation sweep:
 
-**So the justification is capability alone: temporal context inside the representation.** There
-is no efficiency argument for this architecture, and none should be made in the writeup. Whether
-the capability is worth 15–25x is an empirical question that `copy_ratio` and downstream planning
-performance have to answer — it cannot be argued from the cost side.
+| window | tokens | samp/s | hr/epoch | vs matched ViT |
+|---|---|---|---|---|
+| original (10 fr, expand=2, unfused) | 1,960 | 13.3 | 0.53 | 0.430 |
+| optimised, 10 frames | 1,960 | 28.5 | **0.25** | 0.892 |
+| **optimised, 20 frames** | **3,920** | 14.9 | **0.47** | **1.10** |
+
+So the efficiency claim holds, with the scope stated precisely: **at 3,920 tokens Jamba beats a
+parameter-matched ViT by 1.10x, and does so at lower epoch cost than the unoptimised 1,960-token
+configuration.** At 1,960 tokens it does not win (0.892) and no claim should be made there.
+
+**The capability argument still carries the weight it always did.** Beating a ViT that is doing
+the same joint encoding is not the same as showing joint encoding beats per-frame encoding — that
+comparison is still not made anywhere, and §6's original caution applies unchanged. `copy_ratio`
+remains the number that decides whether any of this produced a world model.
 
 Any comparison reported after this change must put the ViT baseline on the same window size.
