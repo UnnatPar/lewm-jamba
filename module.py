@@ -391,7 +391,7 @@ class JambaEncoder(nn.Module):
         #   "unfused" -- keeps Jamba's dt/B/C RMSNorms. The safe default.
         #   "fused"   -- mamba_inner_fn, one kernel per direction, but DROPS those three norms
         #                (Jamba's fix for loss spikes). Larger function class, stability risk.
-        assert mixer_impl in ("unfused", "fused"), mixer_impl
+        assert mixer_impl in ("unfused", "fused", "alternate", "forward_only"), mixer_impl
         self.bidir_mode, self.mixer_impl = bidir_mode, mixer_impl
         assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
         self.patch_size = patch_size

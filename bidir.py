@@ -135,6 +135,55 @@ def bidirectional_fused_forward(self, hidden_states, cache_params=None, attentio
     return y[:n] + y[n:].flip(1)
 
 
+def alternating_fused_forward(self, hidden_states, cache_params=None, attention_mask=None, **kw):
+    """One direction per layer, alternating by depth, instead of both in every layer.
+
+    Every measured lever has now been exhausted except the doubling itself: the fused mixer runs
+    at batch 2B so conv, x_proj, dt_proj, scan, gate and out_proj all happen twice per layer, and
+    that machinery is ~49% of step time (deleting it entirely reaches 1.258x the matched ViT).
+
+    Alternating direction by depth keeps the STACK bidirectional -- even layers scan forward, odd
+    layers backward, so information reaches every position from both sides through depth -- while
+    no single layer pays for two scans. Zero parameters change. It is weaker per layer than
+    per-layer bidirectionality and stronger than a purely causal encoder.
+
+    Whether the weaker per-layer coupling matters is an empirical question, and one worth asking
+    given the measurement that a single mixer at random init has no coupling past ~128 tokens in
+    EITHER direction anyway -- cross-frame mixing already has to come from depth, not from one
+    layer's scan reaching across a 196-token frame boundary.
+    """
+    if (cache_params is not None and hidden_states.size(1) == 1
+            and getattr(cache_params, "has_previous_state", lambda _i: False)(self.layer_idx)):
+        raise NotImplementedError("bidir: incremental decode cannot be bidirectional.")
+
+    xz = self.in_proj(hidden_states).transpose(1, 2)
+    backward = (self.layer_idx % 2) == 1
+    if backward:
+        xz = xz.flip(-1)
+    y = mj.mamba_inner_fn(
+        xz.contiguous(), self.conv1d.weight, self.conv1d.bias,
+        self.x_proj.weight, self.dt_proj.weight,
+        self.out_proj.weight, self.out_proj.bias,
+        -torch.exp(self.A_log.float()), None, None, self.D.float(),
+        delta_bias=self.dt_proj.bias.float(), delta_softplus=True,
+    )
+    return y.flip(1) if backward else y
+
+
+def forward_only_fused_forward(self, hidden_states, cache_params=None, attention_mask=None,
+                               **kw):
+    """Causal encoder. Not a candidate -- it is the bound that says how much the second
+    direction costs, and an encoder that cannot see forward is a capability loss."""
+    xz = self.in_proj(hidden_states).transpose(1, 2)
+    return mj.mamba_inner_fn(
+        xz.contiguous(), self.conv1d.weight, self.conv1d.bias,
+        self.x_proj.weight, self.dt_proj.weight,
+        self.out_proj.weight, self.out_proj.bias,
+        -torch.exp(self.A_log.float()), None, None, self.D.float(),
+        delta_bias=self.dt_proj.bias.float(), delta_softplus=True,
+    )
+
+
 def apply_to(model, impl="unfused"):
     """Bind the bidirectional mixer forward onto every JambaMambaMixer in `model`.
 
@@ -142,7 +191,10 @@ def apply_to(model, impl="unfused"):
     Returns the number of mixers patched -- callers should assert it is nonzero, since a
     silent zero would mean a unidirectional encoder that still trains and still looks fine.
     """
-    fn = {"unfused": bidirectional_forward, "fused": bidirectional_fused_forward}[impl]
+    fn = {"unfused": bidirectional_forward,
+          "fused": bidirectional_fused_forward,
+          "alternate": alternating_fused_forward,
+          "forward_only": forward_only_fused_forward}[impl]
     n = 0
     for m in model.modules():
         if isinstance(m, mj.JambaMambaMixer):
