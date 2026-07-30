@@ -1,0 +1,58 @@
+_target_: jepa.JEPA
+
+window_size: ${window_size}
+window_stride: ${window_stride}
+
+encoder:
+  _target_: module.ViTEncoder
+  image_size: ${img_size}
+  output_dim: ${embed_dim}
+  patch_size: 16
+  # Parameter-matched to the trained JambaEncoder, not chosen. module.match_vit_hidden searched
+  # widths in multiples of 8 (divisibility by the 8 heads) against Jamba's 15,497,922 live
+  # parameters; 352 gives 15,328,736 (-1.09%), the nearest landing point. 360 would be +3.39%.
+  # The residual 1% favours the ViT, which is the direction a baseline should err in.
+  #
+  # Re-derive rather than edit by hand if either encoder's sizing changes:
+  #   python -c "import module; print(module.match_vit_hidden(15_497_922, 20))"
+  hidden_size: 352
+  num_hidden_layers: 10
+  num_attention_heads: 8
+  mlp_ratio: 4
+  max_frames: ${window_size}
+
+predictor:
+  _target_: module.ARPredictor
+  num_frames: ${history_size}
+  input_dim: ${embed_dim}
+  hidden_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.1
+  emb_dropout: 0.0
+
+action_encoder:
+  _target_: module.Embedder
+  input_dim: ???
+  emb_dim: ${embed_dim}
+
+projector:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true
+
+pred_proj:
+  _target_: module.MLP
+  input_dim: ${embed_dim}
+  output_dim: ${embed_dim}
+  hidden_dim: 2048
+  norm_fn:
+    _target_: torch.nn.BatchNorm1d
+    _partial_: true

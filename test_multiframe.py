@@ -65,6 +65,24 @@ def main():
     ok &= check("5D window returns one slot per frame",
                 tuple(out5.shape) == (2, 4, 6), str(tuple(out5.shape)))
 
+    print("\n1b. the ViT baseline honours the same contract")
+    vit = module.ViTEncoder(
+        image_size=32, patch_size=16, output_dim=6, hidden_size=32,
+        num_hidden_layers=2, num_attention_heads=4, max_frames=4,
+    )
+    with torch.no_grad():
+        v4 = vit(torch.randn(2, 3, 32, 32)).last_hidden_state
+        v5 = vit(torch.randn(2, 4, 3, 32, 32)).last_hidden_state
+    ok &= check("ViT 4D input treated as F=1", tuple(v4.shape) == (2, 1, 6), str(tuple(v4.shape)))
+    ok &= check("ViT 5D window returns one slot per frame",
+                tuple(v5.shape) == (2, 4, 6), str(tuple(v5.shape)))
+    # Slot f must be frame f seen through the window, not a copy of a window-wide pooling.
+    # If the per-frame pooling span were wrong, every slot would come out identical and the
+    # last-slot readout in jepa.encode would silently become a window summary.
+    ok &= check("ViT slots differ from one another",
+                (v5[:, 0] - v5[:, -1]).abs().max().item() > 1e-5,
+                f"max|slot0-slotF|={(v5[:, 0] - v5[:, -1]).abs().max().item():.3e}")
+
     print("\n2. window count and action alignment")
     m = make_jepa(W, S)
     info = m.encode({"pixels": torch.randn(B, T, 3, 8, 8),

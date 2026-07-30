@@ -340,6 +340,110 @@ class ConvEncoder(nn.Module):
         return _EncoderOutput(x.unsqueeze(1))  # (N, 1, output_dim)
 
 
+class ViTEncoder(nn.Module):
+    """Parameter-matched ViT baseline, same contract as JambaEncoder: (N,F,C,H,W) ->
+    (N,F,output_dim), joint attention over the whole F*196-token window, pooled within each
+    frame's own patch span.
+
+    This is the baseline every crossover number in the ledger was measured against -- it was
+    living in `crossover2.py` as a benchmark-only module, and is promoted here unchanged (same
+    layer type, depth, head count, FFN ratio and pooling) so the model that gets TRAINED is the
+    same one that was TIMED. Rewriting it as, say, a HF ViT would invalidate the 1.10x.
+
+    Note what this is NOT: the original LeWM encoder is a per-frame HF ViT-tiny/14 consumed at
+    window_size=1. That is a different baseline -- it answers "does joint encoding beat encoding
+    frames separately", which is the primary axiom and still unmeasured. This one answers
+    "at a fixed joint-encoding task, does Jamba beat attention", which is the crossover claim.
+
+    `hidden_size` is not a free choice: it is picked so the parameter count lands on
+    JambaEncoder's. See `match_vit_hidden` below, and config/train/model/vit.yaml.
+    """
+
+    def __init__(
+        self,
+        image_size=224,
+        in_channels=3,
+        patch_size=16,
+        output_dim=192,
+        hidden_size=376,
+        num_hidden_layers=10,
+        num_attention_heads=8,
+        mlp_ratio=4,
+        max_frames=20,
+    ):
+        super().__init__()
+        assert image_size % patch_size == 0, "image_size must be divisible by patch_size"
+        self.patch_size = patch_size
+        self.max_frames = max_frames
+        grid_size = image_size // patch_size
+        num_patches = grid_size * grid_size
+
+        self.patch_embed = nn.Conv2d(
+            in_channels, hidden_size, kernel_size=patch_size, stride=patch_size
+        )
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches, hidden_size) * 0.02)
+        self.frame_embedding = nn.Parameter(
+            torch.randn(1, max_frames, 1, hidden_size) * 0.02
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size, nhead=num_attention_heads,
+            dim_feedforward=hidden_size * mlp_ratio, dropout=0.0,
+            activation="gelu", batch_first=True, norm_first=True)
+        self.enc = nn.TransformerEncoder(layer, num_layers=num_hidden_layers)
+        self.head = nn.Linear(hidden_size, output_dim)
+
+    # Shared with JambaEncoder in behaviour but deliberately duplicated rather than factored
+    # into a mixin: the two encoders are the two arms of a comparison, and a shared base class
+    # is exactly the kind of coupling that later makes an "improvement" silently touch both.
+    def _interpolate_pos_encoding(self, x, height, width):
+        num_patches = x.size(1)
+        num_positions = self.pos_embedding.size(1)
+        if num_patches == num_positions:
+            return self.pos_embedding
+        dim = x.size(-1)
+        old_grid_size = int(num_positions**0.5)
+        new_h, new_w = height // self.patch_size, width // self.patch_size
+        pos = self.pos_embedding.reshape(1, old_grid_size, old_grid_size, dim)
+        pos = pos.permute(0, 3, 1, 2)
+        pos = F.interpolate(pos, size=(new_h, new_w), mode="bicubic", align_corners=False)
+        return pos.permute(0, 2, 3, 1).reshape(1, new_h * new_w, dim)
+
+    def forward(self, pixels, interpolate_pos_encoding=True):
+        if pixels.dim() == 4:
+            pixels = pixels.unsqueeze(1)
+        n, f, _, height, width = pixels.shape
+        assert f <= self.max_frames, (
+            f"window of {f} frames exceeds max_frames={self.max_frames}; frame_embedding has "
+            "no row for the extra frames"
+        )
+        x = self.patch_embed(pixels.flatten(0, 1)).flatten(2).transpose(1, 2)  # (N*F, P, D)
+        pos = (
+            self._interpolate_pos_encoding(x, height, width)
+            if interpolate_pos_encoding
+            else self.pos_embedding
+        )
+        x = x + pos
+        p = x.size(1)
+        x = x.view(n, f, p, -1) + self.frame_embedding[:, :f]
+        x = x.reshape(n, f * p, -1)
+        out = self.enc(x)
+        out = out.view(n, f, p, -1).mean(dim=2)
+        return _EncoderOutput(self.head(out))  # (N, F, output_dim)
+
+
+def match_vit_hidden(target_params, max_frames, lo=256, hi=480, **kw):
+    """Pick the ViT width whose parameter count lands closest to `target_params`, in multiples
+    of 8 (so it stays divisible by the 8 attention heads). Kept in the module rather than in a
+    benchmark script because the chosen width is a claim about fairness that the training config
+    depends on, and it must be re-derivable when either encoder's sizing changes."""
+    best = None
+    for h in range(lo, hi + 1, 8):
+        p = sum(q.numel() for q in ViTEncoder(hidden_size=h, max_frames=max_frames, **kw).parameters())
+        if best is None or abs(p - target_params) < abs(best[1] - target_params):
+            best = (h, p)
+    return best
+
+
 class JambaEncoder(nn.Module):
     """Bidirectional Jamba (hybrid Mamba+Attention) encoder — drop-in replacement for
     ConvEncoder. Matches the same calling convention (`encoder(pixels, interpolate_pos_encoding=...)`)
