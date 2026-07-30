@@ -21,10 +21,17 @@ history_size: 4
 # chunk-efficient window after 1,960 -- 3,920/4,096 = 95.7%, the same efficiency as 1,960/2,048,
 # which is why 12 or 16 frames are worse choices despite being longer than 10.
 #
-# It is also not more expensive than the original: 0.47 hr/epoch at batch 4 versus 0.53 for the
-# unoptimised 10-frame config, with double the temporal context.
+# It is NOT cheap, and an earlier comment here claiming 0.47 hr/epoch was wrong by 22x -- it
+# divided a measured 14.9 samp/s by an assumed ~25k-sample epoch without ever opening the
+# dataset. Measured 2026-07-30: 631,452 samples, 568,306 after the train split, so a real epoch
+# is 10.6 h for Jamba and ~12.0 h for the parameter-matched ViT on an A100-40GB.
 #
-# window_size: 10 is the cheap alternative at 0.25 hr/epoch, but loses to the matched ViT.
+# Note that hr/epoch is not comparable across window_size at all: num_steps is
+# num_preds + history_size + window_size - 1, and the sampleable start positions fall as it
+# grows (631,452 samples at num_steps=24 against 1,888,296 at num_steps=5). Changing the window
+# changes what an epoch IS. Compare samples/s.
+#
+# window_size: 10 is the cheap alternative at 0.89x the matched ViT, which it loses to.
 # window_size: 1 restores the original per-frame encoder exactly.
 window_size: 20
 window_stride: 1

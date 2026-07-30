@@ -14,15 +14,28 @@ fits under the scan's 2,048 chunk boundary.
 > 3. **The crossover is ~3,300 tokens (17 frames).** At 20 frames / 3,920 tokens Jamba runs at
 >    **1.10x** the parameter-matched ViT, and 3,920 is chunk-efficient (95.7% of a 4,096
 >    allocation, the same as 1,960 of 2,048).
-> 4. **It is also cheaper than the original config**: 0.47 hr/epoch versus 0.53, with double the
->    temporal context. So §6's efficiency claim is restored on a real measurement rather than
->    withdrawn — but at 3,920 tokens, never at 1,960.
+> 4. ~~**It is also cheaper than the original config**: 0.47 hr/epoch versus 0.53.~~
+>    **RETRACTED 2026-07-30, and this time the retraction is the durable one.** Every hr/epoch
+>    figure above divided a measured samp/s by an *assumed* dataset size of ~25k samples. The
+>    dataset was never opened. It is **631,452 samples** at `num_steps=24, frameskip=4`
+>    (568,306 after the 0.9 train split), so the real cost is **10.6 hr/epoch for Jamba and
+>    ~12.0 for the ViT** — 22x the claim. See "epochs are not comparable" below.
 >
 > The biggest single win was **alternating the scan direction by depth** (1.47x): even layers scan
 > forward, odd backward, so the stack is bidirectional through depth while no layer runs two scans.
 > It propagates backward slightly better than per-layer bidirectionality, measured.
 >
-> `window_size` is a config knob; 10 frames remains available at 0.25 hr/epoch and 0.89x.
+> **Epochs are not comparable across `window_size`.** `num_steps` is
+> `num_preds + history_size + window_size - 1`, and the number of sampleable start positions
+> falls as that grows — 631,452 samples at `num_steps=24` against **1,888,296** at `num_steps=5`,
+> measured on the same lance dataset. So "hr/epoch" silently changes what an epoch *is* whenever
+> the window changes, and cross-window epoch comparisons are meaningless. The comparable units
+> are **samples/s** and **frame-encodes/s**; quote those. All the speed ratios (0.430 → 0.892,
+> the 1.10x, the 3,300-token crossover) are unaffected — they were always same-shape
+> measurements of the two encoders against each other.
+>
+> `window_size` is a config knob; 10 frames remains available at 0.89x (its epoch size is
+> different again, and unmeasured).
 
 ---
 
@@ -231,15 +244,24 @@ pipeline it replaces.~~
 throughput figures were from the bare mixer and were not trustworthy. Measured on the real full
 JEPA training step (`mfprobe2.py`, A100-40GB, batch 4), after the optimisation sweep:
 
-| window | tokens | samp/s | hr/epoch | vs matched ViT |
-|---|---|---|---|---|
-| original (10 fr, expand=2, unfused) | 1,960 | 13.3 | 0.53 | 0.430 |
-| optimised, 10 frames | 1,960 | 28.5 | **0.25** | 0.892 |
-| **optimised, 20 frames** | **3,920** | 14.9 | **0.47** | **1.10** |
+| window | tokens | samp/s | vs matched ViT | epoch (train samples) | hr/epoch |
+|---|---|---|---|---|---|
+| original (10 fr, expand=2, unfused) | 1,960 | 13.3 | 0.430 | not measured | — |
+| optimised, 10 frames | 1,960 | 28.5 | 0.892 | not measured | — |
+| **optimised, 20 frames** | **3,920** | 14.9 | **1.10** | **568,306** | **10.6** |
+| ViT baseline, 20 frames | 3,920 | 13.2 (measured in the real loop) | 1.00 | 568,306 | **12.0** |
 
-So the efficiency claim holds, with the scope stated precisely: **at 3,920 tokens Jamba beats a
-parameter-matched ViT by 1.10x, and does so at lower epoch cost than the unoptimised 1,960-token
-configuration.** At 1,960 tokens it does not win (0.892) and no claim should be made there.
+**The hr/epoch column was wrong by 22x until 2026-07-30 and is now only filled in where the
+dataset was actually opened.** The earlier 0.53 / 0.25 / 0.47 came from dividing these same
+samp/s by an assumed ~25k-sample epoch. The 10-frame rows stay blank on purpose: `num_steps`
+changes with `window_size`, so those configurations have a *different* epoch, and back-filling
+them from the 20-frame count would repeat the original mistake in the opposite direction.
+
+So the scope of the efficiency claim narrows to what was actually measured: **at 3,920 tokens
+Jamba beats a parameter-matched ViT by 1.10x.** At 1,960 tokens it does not win (0.892). No
+claim about epoch cost survives, in either direction — 20 frames costs 10.6 h/epoch, which is
+not "cheap" by any reading, and the honest statement is that the multi-frame premise is
+expensive and the crossover result is about relative encoder speed, not about total budget.
 
 **The capability argument still carries the weight it always did.** Beating a ViT that is doing
 the same joint encoding is not the same as showing joint encoding beats per-frame encoding — that
