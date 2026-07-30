@@ -59,6 +59,30 @@ so a second run **resumes into the first run's wandb history** instead of creati
 subdir=<tag> output_model_name=<tag>
 ```
 
+## A runtime lives about 90 minutes, so size the run to that
+
+First attempt at a 3.2 h run: at ~1.5 h in, the tunnel started returning **404 on
+`/api/kernels/<id>`** and on `POST /api/kernels`. The backend was gone, not just the kernel, and
+the CLI responded by wiping `~/.config/colab-cli/sessions.json` to `{}` — after which the runtime
+is unaddressable by any `-s` name even though `colab sessions` still lists it as `[?]`. There is
+no reattach command. 25 minutes of training went with it, because the first checkpoint had not
+landed yet.
+
+Two consequences, both design constraints rather than bad luck:
+
+1. **The whole run — prep included — should fit in ~90 minutes.** 22 min of dataset prep plus
+   ~65 min of training is about the practical ceiling. Cap the epoch with
+   `+trainer.limit_train_batches=N` and say in the config comment that the cap is a budget
+   decision, not a modelling one.
+2. **A checkpoint that has not been pulled off the VM does not exist.** Make epochs short enough
+   that one lands early — an epoch that takes longer than the mean time to session death
+   produces nothing.
+
+Cross-session resume is not a way out: the upload direction of the contents API is the
+unreliable one (documented SSL EOF at 163 MB), so a 335 MB Lightning checkpoint cannot be put
+back reliably. Pull the 112 MB `weights_epoch_N.pt` files, not the `.ckpt`s — three times less
+tunnel traffic, and the optimizer state has nothing to be restored into.
+
 ## Checkpoints
 
 `colab drivemount` blocks on an interactive OAuth prompt a headless session cannot answer, so
