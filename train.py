@@ -47,11 +47,19 @@ def lejepa_forward(self, batch, stage, cfg):
     # is equally consistent with a working world model and a well-regularised identity function.
     with torch.no_grad():
         output["copy_loss"] = (ctx_emb - tgt_emb).pow(2).mean()
-        # >1 means the model beats copying; <=1 means it has not learned any dynamics.
-        output["copy_ratio"] = output["copy_loss"] / output["pred_loss"].clamp_min(1e-12)
 
-    losses_dict = {f"{stage}/{k}": v.detach()
-                   for k, v in output.items() if "loss" in k or k == "copy_ratio"}
+    # DO NOT log a per-step copy_loss/pred_loss ratio. An earlier version did, and Lightning
+    # aggregates logged scalars by averaging, so `copy_ratio_epoch` was a MEAN OF RATIOS while
+    # every reader (including the author) took it for the RATIO OF MEANS. Batches where
+    # pred_loss happens to be small put a heavy right tail on it -- single-batch values of 6.15
+    # and 9.33 showed up -- and the epoch statistic climbed past 1.0 and kept going while the
+    # honest ratio of the epoch means sat at 0.42-0.77 and never once exceeded 1. It read as
+    # "the model has learned dynamics" when it had not.
+    #
+    # copy_loss and pred_loss both aggregate correctly. Divide them at analysis time:
+    #     validate/copy_loss_epoch / validate/pred_loss_epoch
+    # >1 means the model beats predicting no change; <=1 means it has not learned any dynamics.
+    losses_dict = {f"{stage}/{k}": v.detach() for k, v in output.items() if "loss" in k}
     self.log_dict(losses_dict, on_step=True, sync_dist=True)
     return output
 
